@@ -1,0 +1,22 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.zig"
+      run: zig fmt {staged_files}
+    lint:
+      glob: "*.zig"
+      run: ziglint src build.zig
+    test:
+      glob: "*.zig"
+      run: zig build test
+
+pre-push:
+  parallel: true
+  commands:
+    fmt:
+      run: zig build fmt
+    lint:
+      run: ziglint
+    test:
+      run: zig build test

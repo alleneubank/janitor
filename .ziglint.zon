@@ -1,0 +1,7 @@
+.{
+    .paths = .{ "src", "build.zig" },
+    .rules = .{
+        // Line length: 120 columns
+        .Z024 = .{ .max_length = 120 },
+    },
+}
