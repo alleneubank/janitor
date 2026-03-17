@@ -54,10 +54,4 @@ flake.nix        # Nix dev environment (zig master, zls, ziglint)
 
 ## Template Usage
 
-1. Create a new repo from this template on GitHub
-2. Replace `zig-template` and `zig_template` with your project name in:
-   - `build.zig` (module name, artifact names)
-   - `build.zig.zon` (package name)
-   - `src/main.zig` (import name)
-3. Run `nix develop` to enter the dev shell
-4. Run `zig build test` to verify everything works
+See [SETUP.md](SETUP.md) for step-by-step instructions to create a new project from this template. Delete `SETUP.md` after cutover.

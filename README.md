@@ -2,9 +2,11 @@
 
 Zig project template with agentic-first tooling, Nix dev environment, and CI.
 
+**[SETUP.md](SETUP.md)** — step-by-step instructions to create a new project from this template.
+
 ## Features
 
-- **Zig master** via [mitchellh/zig-overlay](https://github.com/mitchellh/zig-overlay)
+- **Zig 0.15+** via [mitchellh/zig-overlay](https://github.com/mitchellh/zig-overlay)
 - **ziglint** static analysis (prebuilt binary)
 - **zigdocs** via built-in autodoc (`zig build docs`)
 - **ZLS** language server in dev shell
@@ -13,33 +15,17 @@ Zig project template with agentic-first tooling, Nix dev environment, and CI.
 - **Nix flake** reproducible dev environment
 - **CLAUDE.md** + **AGENTS.md** for AI-assisted development
 
-## Getting Started
-
-### Use as template
-
-1. Click **"Use this template"** on GitHub (or `gh repo create my-project --template 0xbigboss/zig-template --public --clone`)
-2. Replace `zig-template` / `zig_template` with your project name in `build.zig`, `build.zig.zon`, and `src/main.zig`
-3. Enter the dev shell:
+## Quick Start
 
 ```bash
-nix develop
-```
-
-### Build and run
-
-```bash
+nix develop        # enter dev shell
 zig build          # build library + executable
 zig build run      # run the executable
 zig build test     # run all tests
 zig build docs     # generate documentation
 zig build fmt      # check formatting
 ziglint            # run linter
-```
-
-### Setup git hooks
-
-```bash
-lefthook install
+lefthook install   # setup git hooks
 ```
 
 ## Project Structure
@@ -54,6 +40,7 @@ build.zig.zon      # Package manifest
 flake.nix          # Nix dev environment
 CLAUDE.md          # AI agent instructions
 AGENTS.md          # -> CLAUDE.md (symlink)
+SETUP.md           # Template setup guide (delete after use)
 ```
 
 ## Requirements
