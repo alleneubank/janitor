@@ -21,7 +21,7 @@ src/main.zig     # Executable entry point (imports library)
 build.zig        # Build script (test, docs, fmt, run steps)
 build.zig.zon    # Package manifest (name, version, deps)
 .ziglint.zon     # Linter configuration
-flake.nix        # Nix dev environment (zig master, zls, ziglint)
+flake.nix        # Nix dev environment (zig 0.16.0 stable, zls, ziglint)
 ```
 
 ## Build Steps
@@ -37,7 +37,7 @@ flake.nix        # Nix dev environment (zig master, zls, ziglint)
 
 ## Tooling
 
-- **Zig** — master via `mitchellh/zig-overlay` (nix flake)
+- **Zig** — 0.16.0 stable via `mitchellh/zig-overlay` (nix flake)
 - **ZLS** — language server from nixpkgs-unstable
 - **ziglint** — static analysis (prebuilt binary via nix)
 - **lefthook** — git hooks (fmt, lint, test on pre-commit)

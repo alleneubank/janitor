@@ -6,7 +6,7 @@ Zig project template with agentic-first tooling, Nix dev environment, and CI.
 
 ## Features
 
-- **Zig 0.15+** via [mitchellh/zig-overlay](https://github.com/mitchellh/zig-overlay)
+- **Zig 0.16+** via [mitchellh/zig-overlay](https://github.com/mitchellh/zig-overlay)
 - **ziglint** static analysis (prebuilt binary)
 - **zigdocs** via built-in autodoc (`zig build docs`)
 - **ZLS** language server in dev shell

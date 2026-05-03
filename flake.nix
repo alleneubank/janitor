@@ -94,7 +94,7 @@
         devShells.default = pkgs.mkShell {
           name = "zig-dev";
           nativeBuildInputs = [
-            pkgs.zigpkgs."0.15.2"
+            pkgs.zigpkgs."0.16.0"
             pkgs.zls
             pkgs.lefthook
             pkgs.jq
