@@ -1,8 +1,8 @@
 .{
-    .name = .zig_template,
-    .version = "0.0.0",
-    .fingerprint = 0xf2a35603c6ac91c6,
-    .minimum_zig_version = "0.16.0",
+    .name = .janitor,
+    .version = "0.1.0",
+    .fingerprint = 0x1eb8c67b22727db2,
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{},
     .paths = .{
         "build.zig",
@@ -10,5 +10,8 @@
         "src",
         "LICENSE",
         "README.md",
+        "SPEC.md",
+        "install.sh",
+        "scripts",
     },
 }

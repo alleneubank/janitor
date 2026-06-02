@@ -1,57 +1,30 @@
-# zig-template
+# janitor
 
-Zig project template with agentic-first tooling.
+Zig CLI that supervises a child process group and drains it when the wrapper's
+parent or watched worktree disappears.
 
-## Quick Reference
+## Commands
 
-- **Enter dev shell:** `nix develop` (or `direnv allow` with .envrc)
-- **Build:** `zig build`
-- **Run:** `zig build run`
-- **Test:** `zig build test`
-- **Format check:** `zig build fmt`
-- **Lint:** `ziglint`
-- **Generate docs:** `zig build docs` (output in `zig-out/docs/`)
-- **All checks:** `zig build test && zig build fmt && ziglint`
+- Build: `zig build`
+- Run: `zig build run -- --help`
+- Test: `zig build test`
+- Format check: `zig build fmt`
+- Docs: `zig build docs`
 
 ## Project Layout
 
 ```
-src/root.zig     # Library entry point (public API for consumers)
-src/main.zig     # Executable entry point (imports library)
-build.zig        # Build script (test, docs, fmt, run steps)
-build.zig.zon    # Package manifest (name, version, deps)
-.ziglint.zon     # Linter configuration
-flake.nix        # Nix dev environment (zig 0.16.0 stable, zls, ziglint)
+src/root.zig     # Library API, CLI parsing, process supervision
+src/main.zig     # Executable entry point
+src/e2e.zig      # End-to-end test runner invoked by zig build test
+SPEC.md          # Requirements and traceability
 ```
-
-## Build Steps
-
-| Command | Description |
-|---------|-------------|
-| `zig build` | Build library and executable |
-| `zig build run` | Run the executable |
-| `zig build run -- args` | Run with arguments |
-| `zig build test` | Run all unit tests |
-| `zig build docs` | Generate autodoc HTML |
-| `zig build fmt` | Check source formatting |
-
-## Tooling
-
-- **Zig** — 0.16.0 stable via `mitchellh/zig-overlay` (nix flake)
-- **ZLS** — language server from nixpkgs-unstable
-- **ziglint** — static analysis (prebuilt binary via nix)
-- **lefthook** — git hooks (fmt, lint, test on pre-commit)
-- **zig fmt** — canonical formatter (built into zig)
 
 ## Conventions
 
-- Tests live alongside code in `test` blocks within `.zig` files
-- Library public API is in `src/root.zig`; internal modules are separate `.zig` files imported with `@import`
-- Use `std.log.scoped` for namespaced logging
-- Pass allocators explicitly — never use global state for allocation
-- Define explicit error sets — avoid `anyerror`
-- Prefer `const` over `var`; prefer slices over raw pointers
-
-## Template Usage
-
-See [SETUP.md](SETUP.md) for step-by-step instructions to create a new project from this template. Delete `SETUP.md` after cutover.
+- Keep side effects at the supervision boundary; parsing and status encoding
+  should stay testable as pure functions.
+- Teardown must observe process-group liveness, not only the direct child PID.
+- Do not add test-only behavior to `src/root.zig`; e2e tests must exercise the
+  compiled `janitor` binary.
+- Prefer explicit errors and small tagged unions for lifecycle state.

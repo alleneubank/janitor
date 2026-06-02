@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.artifact }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - zig-target: x86_64-linux
+            artifact: linux-x86_64
+          - zig-target: aarch64-linux
+            artifact: linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          ZIG_TARGET: ${{ matrix.zig-target }}
+          ARTIFACT_TARGET: ${{ matrix.artifact }}
+        run: |
+          set -eu
+          version="${RELEASE_TAG#v}"
+          archive_base="janitor-${version}-${ARTIFACT_TARGET}"
+
+          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
+
+          mkdir -p "dist/$archive_base"
+          cp zig-out/bin/janitor "dist/$archive_base/janitor"
+          cp README.md LICENSE "dist/$archive_base/"
+          tar -C dist -czf "dist/$archive_base.tar.gz" "$archive_base"
+          shasum -a 256 "dist/$archive_base.tar.gz" >"dist/$archive_base.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: janitor-${{ matrix.artifact }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft GitHub Release
+    runs-on: ubuntu-latest
+    needs: linux
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          notes="Unsigned Linux archives are attached. Add the signed and notarized macOS zip from scripts/release-macos.sh before publishing."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --notes "$notes"
+          fi

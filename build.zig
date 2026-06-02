@@ -5,20 +5,20 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Library module (exposed to package consumers)
-    const mod = b.addModule("zig_template", .{
+    const mod = b.addModule("janitor", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
 
     // Executable
     const exe = b.addExecutable(.{
-        .name = "zig-template",
+        .name = "janitor",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zig_template", .module = mod },
+                .{ .name = "janitor", .module = mod },
             },
         }),
     });
@@ -39,6 +39,19 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    const e2e_exe = b.addExecutable(.{
+        .name = "janitor-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_e2e = b.addRunArtifact(e2e_exe);
+    run_e2e.addFileArg(exe.getEmittedBin());
+    run_e2e.step.dependOn(&exe.step);
+    test_step.dependOn(&run_e2e.step);
 
     // Documentation
     const docs_step = b.step("docs", "Generate documentation");

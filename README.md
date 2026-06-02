@@ -1,52 +1,143 @@
-# zig-template
+# janitor
 
-Zig project template with agentic-first tooling, Nix dev environment, and CI.
+`janitor` runs a command in its own process group and tears that group down when
+its owner goes away.
 
-**[SETUP.md](SETUP.md)** — step-by-step instructions to create a new project from this template.
+It is meant for development stacks where one layer can die without running a
+clean shutdown: shells, Claude Code sessions, zmx, Tilt, `serve_cmd`, local
+chains, indexers, dev servers, and similar long-running commands.
 
-## Features
+## Why
 
-- **Zig 0.16+** via [mitchellh/zig-overlay](https://github.com/mitchellh/zig-overlay)
-- **ziglint** static analysis (prebuilt binary)
-- **zigdocs** via built-in autodoc (`zig build docs`)
-- **ZLS** language server in dev shell
-- **lefthook** git hooks (format, lint, test)
-- **GitHub Actions** CI (test, lint, fmt, docs)
-- **Nix flake** reproducible dev environment
-- **CLAUDE.md** + **AGENTS.md** for AI-assisted development
+Process trees often outlive the thing that started them. If the parent shell,
+terminal session, editor agent, or Tilt process exits unexpectedly, child
+services can be reparented to `launchd`, `systemd`, or another subreaper and
+keep ports, files, databases, and CPU alive.
 
-## Quick Start
+`janitor` makes that ownership explicit:
 
-```bash
-nix develop        # enter dev shell
-zig build          # build library + executable
-zig build run      # run the executable
-zig build test     # run all tests
-zig build docs     # generate documentation
-zig build fmt      # check formatting
-ziglint            # run linter
-lefthook install   # setup git hooks
+1. Capture the original parent PID.
+2. Spawn the command as a new process-group leader.
+3. Watch the parent, child, signals, and optional worktree path.
+4. On any death trigger, send `SIGTERM` to the child process group.
+5. Wait for the grace window, then send `SIGKILL` if anything remains.
+
+## Install From Source
+
+Requires Zig `0.15.2` or newer.
+
+From a checkout:
+
+```sh
+./install.sh
 ```
 
-## Project Structure
+From GitHub after the repo is published:
 
-```
-src/
-  root.zig         # Library public API
-  main.zig         # Executable entry point
-build.zig          # Build script
-build.zig.zon      # Package manifest
-.ziglint.zon       # Linter config
-flake.nix          # Nix dev environment
-CLAUDE.md          # AI agent instructions
-AGENTS.md          # -> CLAUDE.md (symlink)
-SETUP.md           # Template setup guide (delete after use)
+```sh
+curl -fsSL https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh | sh
 ```
 
-## Requirements
+By default this installs to `~/.local/bin/janitor`. Override with `PREFIX`:
 
-- [Nix](https://nixos.org/download/) with flakes enabled
+```sh
+PREFIX=/usr/local ./install.sh
+```
 
-## License
+If testing before the public remote is renamed, point the installer at any clone
+URL:
 
-MIT
+```sh
+JANITOR_REPO_URL=https://github.com/alleneubank/janitor.git sh install.sh
+```
+
+## Usage
+
+```sh
+janitor [--watch-path PATH] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+```
+
+Examples:
+
+```sh
+janitor --watch-path "$PWD" -- yarn localnet:up
+janitor --watch-path "$PWD" -- bun run src/index.ts daemon
+janitor --grace-ms 500 -- tilt up
+```
+
+`--watch-path` is useful for worktree-based development. If the worktree is
+deleted or moved, `janitor` treats that as a teardown trigger.
+
+`--poll-ms` is accepted for compatibility with earlier development builds. On
+supported platforms, the active watcher is event-driven and does not use
+periodic idle polling.
+
+## Platform Behavior
+
+- macOS and BSD use `kqueue` for process, signal, vnode, and timeout waits.
+- Linux uses `epoll` over `pidfd`, `signalfd`, and `inotify`.
+- Windows is not supported.
+
+The child command is started in a new process group. Teardown only signals that
+group, so unrelated processes are not touched.
+
+## Limitations
+
+- A descendant that deliberately calls `setsid()` or moves to another process
+  group can escape. Wrap that daemon with its own `janitor` if it self-daemonizes.
+- `SIGKILL` sent directly to `janitor` cannot be handled by any userspace
+  wrapper, so cleanup is impossible in that one case.
+- The exit status follows the direct child when available. Signal deaths are
+  encoded as `128 + signal`.
+
+## Build And Test
+
+```sh
+zig build
+zig build run -- --help
+zig build test
+zig build fmt
+zig build docs
+```
+
+`zig build test` includes end-to-end checks that launch real process trees and
+verify watched-path, signal, and parent-death cleanup.
+
+Linux can be typechecked from macOS with:
+
+```sh
+zig build -Dtarget=x86_64-linux
+```
+
+## Release Notes For Maintainers
+
+For macOS distribution outside the App Store, release binaries should be signed
+with a Developer ID Application certificate and submitted to Apple's notary
+service. This repository intentionally does not store signing credentials.
+
+Create a local notarytool keychain profile once. Enter the app-specific password
+only through Apple's secure prompt; do not pass it as a command argument:
+
+```sh
+xcrun notarytool store-credentials janitor-notary \
+  --apple-id "YOUR_APPLE_ID_EMAIL" \
+  --team-id H93YRR23HH
+```
+
+Build the signed and notarized macOS archive locally:
+
+```sh
+scripts/release-macos.sh
+```
+
+Use `scripts/release-macos.sh --dry-run --skip-sign --skip-notarize` to inspect
+the release commands without requiring signing credentials.
+
+The script checks `codesign` locally and waits for Apple notarization to return
+`Accepted`. Raw CLI zip archives are not stapled like app bundles or packages,
+so Gatekeeper checks the notarization ticket online after download.
+
+Version tags create a draft GitHub Release with unsigned Linux archives and
+checksum files. Attach the signed and notarized macOS zip from `dist/` before
+publishing the release. Homebrew can come later once archive URLs and checksums
+are stable.
