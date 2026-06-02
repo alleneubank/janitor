@@ -22,17 +22,10 @@ keep ports, files, databases, and CPU alive.
 4. On any death trigger, send `SIGTERM` to the child process group.
 5. Wait for the grace window, then send `SIGKILL` if anything remains.
 
-## Install From Source
+## Install
 
-Requires Zig `0.15.2` or newer.
-
-From a checkout:
-
-```sh
-./install.sh
-```
-
-From GitHub after the repo is published:
+The installer defaults to the latest stable GitHub Release and selects the
+archive for the current platform.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh | sh
@@ -41,14 +34,20 @@ curl -fsSL https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh
 By default this installs to `~/.local/bin/janitor`. Override with `PREFIX`:
 
 ```sh
-PREFIX=/usr/local ./install.sh
+curl -fsSL https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh | PREFIX=/usr/local sh
 ```
 
-If testing before the public remote is renamed, point the installer at any clone
-URL:
+Install a specific release tag:
 
 ```sh
-JANITOR_REPO_URL=https://github.com/alleneubank/janitor.git sh install.sh
+curl -fsSL https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh | JANITOR_VERSION=v0.1.0 sh
+```
+
+Source installation remains available for unsupported platforms and maintainer
+testing. It requires Zig `0.15.2` or newer:
+
+```sh
+JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 ```
 
 ## Usage
@@ -111,9 +110,10 @@ zig build -Dtarget=x86_64-linux
 
 ## Release Notes For Maintainers
 
-For macOS distribution outside the App Store, release binaries should be signed
-with a Developer ID Application certificate and submitted to Apple's notary
-service. This repository intentionally does not store signing credentials.
+For macOS distribution outside the App Store, release binaries are signed with a
+Developer ID Application certificate and submitted to Apple's notary service.
+This repository intentionally keeps signing credentials in GitHub Secrets or the
+local macOS keychain, never in tracked files.
 
 Create a local notarytool keychain profile once. Enter the app-specific password
 only through Apple's secure prompt; do not pass it as a command argument:
@@ -124,7 +124,7 @@ xcrun notarytool store-credentials janitor-notary \
   --team-id H93YRR23HH
 ```
 
-Build the signed and notarized macOS archive locally:
+Build a signed and notarized macOS archive locally:
 
 ```sh
 scripts/release-macos.sh
@@ -137,7 +137,7 @@ The script checks `codesign` locally and waits for Apple notarization to return
 `Accepted`. Raw CLI zip archives are not stapled like app bundles or packages,
 so Gatekeeper checks the notarization ticket online after download.
 
-Version tags create a draft GitHub Release with unsigned Linux archives and
-checksum files. Attach the signed and notarized macOS zip from `dist/` before
-publishing the release. Homebrew can come later once archive URLs and checksums
-are stable.
+Version tags create a draft GitHub Release with prebuilt Linux and macOS
+archives plus checksum files. The macOS archives are signed and notarized in
+GitHub Actions when the required Apple signing secrets are present. Homebrew can
+come later once archive URLs and checksums are stable.

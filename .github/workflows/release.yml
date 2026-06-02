@@ -17,6 +17,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  CODESIGN_IDENTITY: "Developer ID Application: Allen Eubank (H93YRR23HH)"
+
 jobs:
   linux:
     name: Linux ${{ matrix.artifact }}
@@ -59,10 +62,110 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  macos:
+    name: macOS ${{ matrix.artifact }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - zig-target: aarch64-macos
+            artifact: macos-arm64
+          - zig-target: x86_64-macos
+            artifact: macos-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build, sign, and notarize archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          ZIG_TARGET: ${{ matrix.zig-target }}
+          ARTIFACT_TARGET: ${{ matrix.artifact }}
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -eu
+          [ -n "$MACOS_CERTIFICATE_P12" ] || {
+            echo "MACOS_CERTIFICATE_P12 secret is required" >&2
+            exit 1
+          }
+          [ -n "$APPLE_ID" ] || {
+            echo "APPLE_ID secret is required" >&2
+            exit 1
+          }
+          [ -n "$APPLE_TEAM_ID" ] || {
+            echo "APPLE_TEAM_ID secret is required" >&2
+            exit 1
+          }
+          [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] || {
+            echo "APPLE_APP_SPECIFIC_PASSWORD secret is required" >&2
+            exit 1
+          }
+
+          version="${RELEASE_TAG#v}"
+          archive_base="janitor-${version}-${ARTIFACT_TARGET}"
+          zip_path="dist/$archive_base.zip"
+          keychain_path="$RUNNER_TEMP/janitor-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          notary_profile="janitor-ci-notary"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode >"$certificate_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "${MACOS_CERTIFICATE_PASSWORD:-}" \
+            -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain_path" "$HOME/Library/Keychains/login.keychain-db"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          rm -f "$certificate_path"
+          xcrun notarytool store-credentials "$notary_profile" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --keychain "$keychain_path"
+
+          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
+          codesign --force --timestamp --options runtime \
+            --sign "$CODESIGN_IDENTITY" \
+            zig-out/bin/janitor
+          codesign --verify --strict --verbose=2 zig-out/bin/janitor
+
+          mkdir -p "dist/$archive_base"
+          cp zig-out/bin/janitor "dist/$archive_base/janitor"
+          cp README.md LICENSE "dist/$archive_base/"
+          ditto -c -k --keepParent "dist/$archive_base" "$zip_path"
+
+          xcrun notarytool submit "$zip_path" \
+            --keychain-profile "$notary_profile" \
+            --keychain "$keychain_path" \
+            --wait
+          shasum -a 256 "$zip_path" >"$zip_path.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: janitor-${{ matrix.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
   draft-release:
     name: Draft GitHub Release
     runs-on: ubuntu-latest
-    needs: linux
+    needs:
+      - linux
+      - macos
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -75,7 +178,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -eu
-          notes="Unsigned Linux archives are attached. Add the signed and notarized macOS zip from scripts/release-macos.sh before publishing."
+          notes="Prebuilt janitor release archives are attached for Linux and macOS. macOS archives are signed with Developer ID and notarized by Apple."
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"

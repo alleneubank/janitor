@@ -23,6 +23,8 @@ group, watches for owner-death signals, and drains that group with
 - **Notary profile**: a local keychain profile created by `notarytool
   store-credentials`; it is referenced by name and keeps Apple credentials out
   of scripts, logs, and command arguments.
+- **Stable release**: the latest non-draft, non-prerelease GitHub Release
+  selected by GitHub's `releases/latest` endpoint.
 
 ## Requirements
 
@@ -67,8 +69,17 @@ group, watches for owner-death signals, and drains that group with
 - **REQ-RELEASE-004**: Release archive names include the package version and
   target platform, and each archive has a SHA-256 checksum file.
 - **REQ-RELEASE-005**: GitHub Actions creates draft GitHub Releases for version
-  tags with unsigned Linux archives; signed and notarized macOS archives are
-  attached separately unless CI signing secrets are added later.
+  tags with prebuilt archives for common Linux and macOS targets.
+- **REQ-RELEASE-006**: GitHub Actions signs macOS release binaries with a
+  Developer ID Application certificate and submits the archives to Apple's
+  notary service before attaching them to the draft release.
+- **REQ-INSTALL-001**: `install.sh` defaults to the latest stable GitHub Release
+  and selects the archive matching the host operating system and CPU
+  architecture.
+- **REQ-INSTALL-002**: `install.sh` verifies the downloaded archive against its
+  release SHA-256 sidecar before installing the binary.
+- **REQ-INSTALL-003**: `install.sh` keeps source installation available as an
+  explicit fallback for maintainers and unsupported platforms.
 
 ## Invariants
 
@@ -79,10 +90,11 @@ group, watches for owner-death signals, and drains that group with
   drained.
 - Parent death is detected as `getppid() != original_parent`, not
   `getppid() == 1`.
-- Release scripts never print or receive secret values directly; secret material
-  stays in the macOS keychain or GitHub Secrets.
+- Release automation never prints secret values; local secret material stays in
+  the macOS keychain, and CI secret material stays in GitHub Secrets plus
+  temporary runner keychains.
 - A GitHub Release remains draft until a maintainer reviews the generated
-  artifacts and attaches any locally signed macOS archive.
+  artifacts.
 
 ## Non-Goals
 
@@ -94,8 +106,8 @@ group, watches for owner-death signals, and drains that group with
   own nested janitor.
 - No signed macOS `.pkg` artifact until a Developer ID Installer certificate is
   available.
-- No Apple signing or notarization secrets in GitHub Actions in the first binary
-  release flow.
+- No Windows binary release until the implementation supports Windows process
+  supervision semantics.
 
 ## Acceptance Criteria
 
@@ -108,8 +120,10 @@ group, watches for owner-death signals, and drains that group with
 - [x] `zig build fmt` passes.
 - [x] Supported platforms use kqueue/epoll event waits instead of idle polling.
 - [x] Local macOS release automation has a syntax check and dry-run path.
-- [x] Draft GitHub Release automation builds Linux ReleaseSafe archives with
-      SHA-256 checksums.
+- [x] Draft GitHub Release automation builds ReleaseSafe archives for common
+      Linux and macOS targets with SHA-256 checksums.
+- [x] `install.sh` defaults to the latest stable GitHub Release asset, verifies
+      checksums, and installs the selected binary.
 - [x] Release documentation describes keychain-profile notarization without
       asking maintainers to pass passwords on the command line.
 
@@ -128,4 +142,7 @@ group, watches for owner-death signals, and drains that group with
 - REQ-RELEASE-001, REQ-RELEASE-002, REQ-RELEASE-003, REQ-RELEASE-004:
   `scripts/release-macos.sh`, `sh -n scripts/release-macos.sh`, and
   `scripts/release-macos.sh --dry-run --skip-sign --skip-notarize`.
-- REQ-RELEASE-005: `.github/workflows/release.yml`.
+- REQ-RELEASE-005, REQ-RELEASE-006: `.github/workflows/release.yml`.
+- REQ-INSTALL-001, REQ-INSTALL-002, REQ-INSTALL-003: `install.sh`, `sh -n
+  install.sh`, `JANITOR_INSTALL_DRY_RUN=1 ./install.sh`, and
+  `JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh`.
