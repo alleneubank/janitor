@@ -181,6 +181,11 @@ jobs:
           notes="Prebuilt janitor release archives are attached for Linux and macOS. macOS archives are signed with Developer ID and notarized by Apple."
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --notes "$notes" \
+              --repo "$GITHUB_REPOSITORY"
             gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$RELEASE_TAG" dist/* \
