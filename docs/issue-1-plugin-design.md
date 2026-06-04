@@ -76,10 +76,12 @@ below. Field names here are observed, not guessed.
   `zsh (per-command)` → `claude` for foreground. Implications in
   "Death-trigger analysis" — this is why `--watch-pid` is **required**, not
   optional.
-- **A5 (high) — plugin hooks** are registered via `.claude-plugin/plugin.json`
-  pointing at `hooks/hooks.json`, matcher on tool name (`"Bash"`),
-  `${CLAUDE_PLUGIN_ROOT}` resolves bundled files, `${CLAUDE_PLUGIN_DATA}` is a
-  writable per-plugin dir.
+- **A5 (high) — plugin hooks** are registered via the plugin's standard
+  `hooks/hooks.json`, which Claude Code auto-loads; the `.claude-plugin/plugin.json`
+  manifest must NOT also reference it (`manifest.hooks` is only for *additional*
+  hook files, else the loader rejects it as a duplicate). Matcher on tool name
+  (`"Bash"`), `${CLAUDE_PLUGIN_ROOT}` resolves bundled files,
+  `${CLAUDE_PLUGIN_DATA}` is a writable per-plugin dir.
 
 ## Death-trigger analysis (the core of the design)
 
@@ -128,8 +130,8 @@ testable and dependency-free.
 
 ```
 plugin/                              # the distributable Claude Code plugin
-  .claude-plugin/plugin.json         # name, version, hooks -> hooks/hooks.json, config schema
-  hooks/hooks.json                   # PreToolUse(Bash) + SessionEnd(+SessionStart) -> janitor cc-hook ...
+  .claude-plugin/plugin.json         # name, version, description (NOT hooks: hooks/hooks.json auto-loads)
+  hooks/hooks.json                   # auto-loaded; PreToolUse(Bash) + SessionEnd -> janitor cc-hook ...
   README.md
 janitor (binary)                     # gains a `cc-hook` subcommand (see below)
 ```
