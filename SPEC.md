@@ -92,6 +92,24 @@ group, watches for owner-death signals, and drains that group with
   release SHA-256 sidecar before installing the binary.
 - **REQ-INSTALL-003**: `install.sh` keeps source installation available as an
   explicit fallback for maintainers and unsupported platforms.
+- **REQ-PLUGIN-001**: A Claude Code plugin registers a PreToolUse(Bash) hook
+  that rewrites the command to run under `janitor`, requiring no per-command
+  user action.
+- **REQ-PLUGIN-002**: The hook re-injects a shell (`bash -c '<orig>'`) so shell
+  operators (`&&`, `|`, `;`) in the original command are preserved (janitor
+  execs an argv after `--`, not a shell string).
+- **REQ-PLUGIN-003**: A per-session lock file keyed by `session_id` exists
+  before any wrapped command runs (janitor tears down immediately if
+  `--watch-path` is missing at startup) and is passed via `--watch-path`.
+- **REQ-PLUGIN-004**: SessionEnd deletes the lock as a best-effort clean-exit
+  teardown; correctness does not depend on it firing.
+- **REQ-PLUGIN-005**: The hook fails open -- on any error, unsupported platform,
+  or missing `janitor`, the original command runs unmodified.
+- **REQ-PLUGIN-006**: The hook does not double-wrap an already-`janitor` command
+  and skips configured read-only/trivial patterns.
+- **REQ-PLUGIN-007**: The plugin resolves the `claude` session PID (ancestry
+  walk, `comm == "claude"`) and passes it via `--watch-pid`, since neither
+  parent-PID nor SessionEnd is reliable on a hard session kill.
 
 ## Invariants
 
@@ -150,6 +168,10 @@ group, watches for owner-death signals, and drains that group with
       checksums, and installs the selected binary.
 - [x] Release documentation describes keychain-profile notarization without
       asking maintainers to pass passwords on the command line.
+- [x] `janitor cc-hook pretooluse` rewrites a Bash command under `janitor` and
+      fails open on malformed input.
+- [x] The Claude Code plugin manifest and hooks JSON are valid and register the
+      expected hooks.
 
 ## Test Traceability
 
@@ -173,3 +195,13 @@ group, watches for owner-death signals, and drains that group with
 - REQ-INSTALL-001, REQ-INSTALL-002, REQ-INSTALL-003: `install.sh`, `sh -n
   install.sh`, `JANITOR_INSTALL_DRY_RUN=1 ./install.sh`, and
   `JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh`.
+- REQ-PLUGIN-001, REQ-PLUGIN-002, REQ-PLUGIN-006: `src/cc_hook.zig` `decide`,
+  `matchesSkip`, `buildWrappedCommand`, and `singleQuoteEscape` tests; plus
+  `plugin/hooks/hooks.json`.
+- REQ-PLUGIN-003, REQ-PLUGIN-004: `src/cc_hook.zig` `lockPathForBase` test and
+  `cc-hook session-end` lock deletion; plus `plugin/hooks/hooks.json`.
+- REQ-PLUGIN-005: `src/cc_hook.zig` `parsePreToolUse` lenient/defaulting tests
+  and the fail-open `main`; plus `plugin/hooks/hooks.json`
+  (`janitor cc-hook ... 2>/dev/null || true`).
+- REQ-PLUGIN-007: `src/cc_hook.zig` `resolveClaudePidWalk` and `isShellComm`
+  tests.

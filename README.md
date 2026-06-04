@@ -87,6 +87,23 @@ periodic idle polling.
 The child command is started in a new process group. Teardown only signals that
 group, so unrelated processes are not touched.
 
+## Claude Code plugin
+
+The bundled Claude Code plugin wraps the `Bash` tool so processes a session
+starts are drained by `janitor` when the session ends, including crashes,
+`/clear`, and closed terminals.
+
+It registers a `PreToolUse(Bash)` hook (`janitor cc-hook pretooluse`) that
+rewrites commands to run under `janitor`, tied to the session by a per-session
+lock (`--watch-path`) and the Claude session PID (`--watch-pid`). A `SessionEnd`
+hook drops the lock on clean exits.
+
+The hook fails open: if `janitor` is missing, unsupported, or errors, commands
+run unmodified. The plugin supports macOS and Linux only.
+
+See `plugin/` and `plugin/README.md` for install details and the `JANITOR_CC_*`
+configuration knobs.
+
 ## Limitations
 
 - A descendant that deliberately calls `setsid()` or moves to another process
