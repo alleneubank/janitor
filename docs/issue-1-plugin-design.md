@@ -252,7 +252,7 @@ Resolved in order (later overrides earlier): plugin defaults →
   or missing `janitor`, the original command runs unmodified.
 - **REQ-PLUGIN-006**: The hook does not double-wrap an already-`janitor` command
   and skips configured read-only/trivial patterns.
-- **REQ-JANITOR-013 (required, per A4)**: janitor accepts `--watch-pid PID` and
+- **REQ-JANITOR-014 (required, per A4)**: janitor accepts `--watch-pid PID` and
   tears down the child process group when that PID exits, watched via the same
   event backend as the parent/child PIDs (kqueue `EVFILT_PROC` / Linux `pidfd`).
 - **REQ-PLUGIN-007**: the plugin resolves the `claude` session PID (ancestry
@@ -287,7 +287,7 @@ Resolved in order (later overrides earlier): plugin defaults →
 
 ## Plan (phased — spike complete)
 
-1. **janitor `--watch-pid PID`** in `root.zig` (REQ-JANITOR-013): add a third
+1. **janitor `--watch-pid PID`** in `root.zig` (REQ-JANITOR-014): add a third
    proc watch alongside parent/child in both `KqueueWatcher` and `LinuxWatcher`,
    parse the flag in `parseArgs`, map its `NOTE_EXIT`/`pidfd` event to a new
    teardown reason. SPEC + e2e (AC2 crash path, extends `src/e2e.zig`).
@@ -299,7 +299,7 @@ Resolved in order (later overrides earlier): plugin defaults →
    `hooks/hooks.json` (PreToolUse(Bash) + SessionEnd), README, config schema.
    Manual install test, then marketplace metadata.
 4. **Docs + SPEC**: new "Claude Code plugin" section in repo README; `SPEC.md`
-   REQ additions (REQ-JANITOR-013, REQ-PLUGIN-001..007) with traceability rows.
+   REQ additions (REQ-JANITOR-014, REQ-PLUGIN-001..007) with traceability rows.
 
 High-risk per `CLAUDE.md` ADF: adds a public plugin surface and a CLI flag, so
 PLAN approval is expected before DEV.
