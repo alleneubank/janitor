@@ -28,6 +28,9 @@ group, watches for owner-death signals, and drains that group with
   of scripts, logs, and command arguments.
 - **Stable release**: the latest non-draft, non-prerelease GitHub Release
   selected by GitHub's `releases/latest` endpoint.
+- **Build metadata**: the package version (from `build.zig.zon`) and the short
+  git commit the binary was built from, injected at build time and surfaced by
+  the version command so a deployed binary can be matched to its source.
 
 ## Requirements
 
@@ -68,6 +71,11 @@ group, watches for owner-death signals, and drains that group with
   terminal, `janitor` leaves terminal state untouched.
 - **REQ-JANITOR-014**: If the `--watch-pid` PID exits, `janitor` tears down the
   child process group.
+- **REQ-JANITOR-015**: `janitor --version`, `janitor -V`, and the `janitor
+  version` subcommand print the package version and the build-time short git
+  commit (`janitor <version> (<sha>)`) to standard output and exit 0. The
+  version is single-sourced from `build.zig.zon`; the commit degrades to
+  `unknown` when built outside a git checkout.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, signs the binary with a Developer ID Application
   certificate, packages README and LICENSE beside the binary, and submits the
@@ -147,6 +155,8 @@ group, watches for owner-death signals, and drains that group with
 ## Acceptance Criteria
 
 - [x] `janitor -- sh -c 'exit 7'` exits with status 7.
+- [x] `janitor --version`, `janitor -V`, and `janitor version` print the
+      `janitor <version> (<sha>)` banner and exit 0.
 - [x] Deleting `--watch-path` kills a TERM-ignoring descendant with `SIGKILL`.
 - [x] Sending `SIGTERM` to `janitor` kills a TERM-ignoring descendant with
       `SIGKILL`.
@@ -184,6 +194,8 @@ group, watches for owner-death signals, and drains that group with
   `src/e2e.zig` `testParentDeathKillsProcessGroup`.
 - REQ-JANITOR-014: `src/root.zig` parse tests, `src/e2e.zig`
   `testWatchPidKillsProcessGroup`.
+- REQ-JANITOR-015: `src/root.zig` `versionLine` test, `src/e2e.zig`
+  `testVersionCommand`.
 - REQ-JANITOR-009: `src/e2e.zig` `testNormalExit`.
 - REQ-JANITOR-010, REQ-JANITOR-011, REQ-JANITOR-012: `src/root.zig` watcher
   backend selection, plus native and cross-target builds.

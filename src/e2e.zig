@@ -32,12 +32,44 @@ pub fn main() !void {
     }
 
     const janitor_exe = args[1];
+    try testVersionCommand(allocator, janitor_exe);
     try testNormalExit(allocator, janitor_exe);
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
     try testWatchPidKillsProcessGroup(allocator, janitor_exe);
     try testSignalKillsProcessGroup(allocator, janitor_exe);
     try testParentDeathKillsProcessGroup(allocator, janitor_exe);
     try testInteractiveForegroundHandoff(allocator, janitor_exe);
+}
+
+// REQ-JANITOR-015: `janitor --version`, `-V`, and the `version` subcommand each
+// print the package version plus build-time git sha to stdout and exit 0, so a
+// deployed binary can be matched back to its source. Exercises the compiled
+// binary (not the library) per the project's e2e convention.
+fn testVersionCommand(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    const forms = [_][]const u8{ "--version", "-V", "version" };
+    for (forms) |form| {
+        const result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ janitor_exe, form },
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        try expectExited(result.term, 0, "version request exits 0");
+
+        // Assert the banner shape ("janitor <version> (<sha>)") without pinning
+        // the exact version/sha, which change per release and per build.
+        if (!std.mem.startsWith(u8, result.stdout, "janitor ")) {
+            std.debug.print("version form {s}: missing banner prefix: {s}\n", .{ form, result.stdout });
+            return error.VersionBannerMissing;
+        }
+        if (std.mem.indexOfScalar(u8, result.stdout, '(') == null or
+            std.mem.indexOfScalar(u8, result.stdout, ')') == null)
+        {
+            std.debug.print("version form {s}: missing sha parens: {s}\n", .{ form, result.stdout });
+            return error.VersionShaMissing;
+        }
+    }
 }
 
 // REQ-JANITOR-013: with a controlling terminal, janitor must hand terminal

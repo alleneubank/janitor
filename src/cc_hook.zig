@@ -3,6 +3,10 @@ const std = @import("std");
 
 const posix = std.posix;
 
+// Scoped so fail-open diagnostics are filterable and silent unless debug logging
+// is enabled; the plugin hook redirects this binary's stderr to /dev/null.
+const log = std.log.scoped(.janitor_cc_hook);
+
 const default_grace_ms: u64 = 1500;
 const max_hook_input_bytes: usize = 1024 * 1024;
 const max_pid_walk_hops: usize = 8;
@@ -20,7 +24,7 @@ pub const default_skip_patterns = [_][]const u8{
     "git show",
 };
 
-const empty_patterns = [_][]const u8{};
+const empty_patterns: [0][]const u8 = .{};
 
 pub const WrapMode = enum {
     all,
@@ -39,7 +43,9 @@ pub const PreToolUse = struct {
     command: []const u8,
     run_in_background: bool,
 
-    pub fn deinit(self: *const PreToolUse) void {
+    // Takes self by value (like PatternSet/HookConfig deinit) so freeing owned
+    // slices needs no mutable borrow at the const call sites.
+    pub fn deinit(self: PreToolUse) void {
         self.allocator.free(self.session_id);
         self.allocator.free(self.tool_name);
         self.allocator.free(self.command);
@@ -101,10 +107,17 @@ pub fn main(allocator: std.mem.Allocator, subcommand: ?[]const u8) void {
     if (builtin.os.tag == .windows) return;
 
     const cmd = subcommand orelse return;
+    // REQ-PLUGIN-005: the hook fails open. Errors are surfaced at debug level
+    // (the hook's stderr is /dev/null'd) but never propagate, so a janitor
+    // fault can never break the user's Bash command.
     if (std.mem.eql(u8, cmd, "pretooluse")) {
-        runPreToolUse(allocator) catch {};
+        runPreToolUse(allocator) catch |err| {
+            log.debug("pretooluse failed: {s}", .{@errorName(err)});
+        };
     } else if (std.mem.eql(u8, cmd, "session-end")) {
-        runSessionEnd(allocator) catch {};
+        runSessionEnd(allocator) catch |err| {
+            log.debug("session-end failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
@@ -220,7 +233,7 @@ pub fn singleQuoteEscape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     }
     try out.writer.writeByte('\'');
 
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 pub fn buildWrappedCommand(allocator: std.mem.Allocator, params: WrappedCommandParams) ![]u8 {
@@ -246,7 +259,7 @@ pub fn buildWrappedCommand(allocator: std.mem.Allocator, params: WrappedCommandP
     if (params.pid) |pid| try out.writer.print(" --watch-pid {}", .{pid});
     try out.writer.print(" --grace-ms {} -- {s} -c {s}", .{ params.grace_ms, escaped_shell, escaped_command });
 
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 pub fn lockPathFor(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
@@ -506,18 +519,18 @@ fn isAlreadyWrapped(command: []const u8) bool {
 }
 
 fn stripLeadingEnvAssignments(command: []const u8) []const u8 {
-    var rest = std.mem.trimLeft(u8, command, " \t\r\n");
+    var rest = std.mem.trimStart(u8, command, " \t\r\n");
     while (true) {
         const token_len = tokenLength(rest);
         if (token_len == 0) return rest;
         const token = rest[0..token_len];
         if (!isEnvAssignmentToken(token)) return rest;
-        rest = std.mem.trimLeft(u8, rest[token_len..], " \t\r\n");
+        rest = std.mem.trimStart(u8, rest[token_len..], " \t\r\n");
     }
 }
 
 fn firstToken(command: []const u8) []const u8 {
-    const trimmed = std.mem.trimLeft(u8, command, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, command, " \t\r\n");
     return trimmed[0..tokenLength(trimmed)];
 }
 
@@ -628,7 +641,11 @@ test "buildWrappedCommand omits optional triggers and preserves wrapper shape" {
         .command = "npm test",
     });
     defer allocator.free(plain);
-    try std.testing.expectEqualStrings("'janitor' --watch-path '/tmp/s.lock' --watch-pid 123 --grace-ms 1500 -- 'bash' -c 'npm test'", plain);
+    try std.testing.expectEqualStrings(
+        "'janitor' --watch-path '/tmp/s.lock' --watch-pid 123 --grace-ms 1500 " ++
+            "-- 'bash' -c 'npm test'",
+        plain,
+    );
 
     const no_lock = try buildWrappedCommand(allocator, .{
         .janitor = "janitor",
@@ -644,7 +661,10 @@ test "buildWrappedCommand omits optional triggers and preserves wrapper shape" {
         .command = "npm test",
     });
     defer allocator.free(no_pid);
-    try std.testing.expectEqualStrings("'janitor' --watch-path '/tmp/s.lock' --grace-ms 1500 -- 'bash' -c 'npm test'", no_pid);
+    try std.testing.expectEqualStrings(
+        "'janitor' --watch-path '/tmp/s.lock' --grace-ms 1500 -- 'bash' -c 'npm test'",
+        no_pid,
+    );
 }
 
 test "buildWrappedCommand escapes complex original command" {
@@ -657,7 +677,11 @@ test "buildWrappedCommand escapes complex original command" {
     });
     defer allocator.free(wrapped);
 
-    try std.testing.expectEqualStrings("'janitor' --watch-path '/tmp/s.lock' --watch-pid 123 --grace-ms 1500 -- 'bash' -c 'echo '\\''hi'\\'' && printf foo | cat'", wrapped);
+    try std.testing.expectEqualStrings(
+        "'janitor' --watch-path '/tmp/s.lock' --watch-pid 123 --grace-ms 1500 " ++
+            "-- 'bash' -c 'echo '\\''hi'\\'' && printf foo | cat'",
+        wrapped,
+    );
 }
 
 test "buildWrappedCommand quotes paths with spaces" {
@@ -671,7 +695,11 @@ test "buildWrappedCommand quotes paths with spaces" {
     });
     defer allocator.free(wrapped);
 
-    try std.testing.expectEqualStrings("'/opt/my janitor/janitor' --watch-path '/tmp/runtime dir/s.lock' --watch-pid 123 --grace-ms 1500 -- '/bin/my bash' -c 'npm test'", wrapped);
+    try std.testing.expectEqualStrings(
+        "'/opt/my janitor/janitor' --watch-path '/tmp/runtime dir/s.lock' " ++
+            "--watch-pid 123 --grace-ms 1500 -- '/bin/my bash' -c 'npm test'",
+        wrapped,
+    );
 }
 
 test "buildWrappedCommand ignores Claude background flag" {

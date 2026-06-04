@@ -54,7 +54,12 @@ JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 
 ```sh
 janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+janitor version | --version | -V
 ```
+
+`janitor version` (or `--version` / `-V`) prints `janitor <version> (<sha>)`,
+where `<sha>` is the short git commit the binary was built from (`unknown` when
+built outside a git checkout), so a deployed binary can be matched to its source.
 
 Examples:
 

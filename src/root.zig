@@ -2,10 +2,27 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+// Build-time metadata: version single-sourced from build.zig.zon, git_sha
+// resolved during `zig build`. See build.zig.
+const build_info = @import("build_info");
 
 const posix = std.posix;
 
-pub const version = "0.1.1";
+/// Package version, single-sourced from build.zig.zon so the lib, executable,
+/// and release archives never drift.
+pub const version = build_info.version;
+
+/// Short git commit the binary was built from, or "unknown" when built outside
+/// a git checkout (e.g. from a release source tarball).
+pub const git_sha = build_info.git_sha;
+
+/// REQ-JANITOR-015: formats the version banner ("janitor <version> (<sha>)")
+/// into `buf` and returns the written slice (no trailing newline). Buffer-based
+/// rather than writer-based so the executable's stdout path and the unit test
+/// share one formatting routine; 256 bytes is ample for a semver and short sha.
+pub fn versionLine(buf: []u8) std.fmt.BufPrintError![]const u8 {
+    return std.fmt.bufPrint(buf, "janitor {s} ({s})", .{ version, git_sha });
+}
 
 const default_grace_ms: u64 = 1500;
 const default_poll_ms: u64 = 100;
@@ -125,7 +142,12 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
     defer restoreTerminalForeground(&terminal_foreground);
 
     var child_state: ChildState = .running;
-    var watcher = Watcher.init(original_parent, child_pid, config.watch_path, config.watch_pid) catch return error.WaitFailed;
+    var watcher = Watcher.init(
+        original_parent,
+        child_pid,
+        config.watch_path,
+        config.watch_pid,
+    ) catch return error.WaitFailed;
     defer watcher.deinit();
 
     if (getParentPid() != original_parent) {
@@ -136,7 +158,14 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
         const event = watcher.wait(null) catch return error.WaitFailed;
         switch (event) {
             .parent_exited => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .parent_exited),
-            .watched_pid_exited => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .watched_pid_exited),
+            .watched_pid_exited => return teardown(
+                child_pid,
+                child_pgid,
+                config,
+                &watcher,
+                &child_state,
+                .watched_pid_exited,
+            ),
             .path_missing => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .path_missing),
             .signal => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .signal),
             .child_exited => {
@@ -400,7 +429,12 @@ const KqueueWatcher = struct {
         watched = 5,
     };
 
-    fn init(parent_pid: posix.pid_t, child_pid: posix.pid_t, watch_path: ?[]const u8, watch_pid: ?posix.pid_t) !KqueueWatcher {
+    fn init(
+        parent_pid: posix.pid_t,
+        child_pid: posix.pid_t,
+        watch_path: ?[]const u8,
+        watch_pid: ?posix.pid_t,
+    ) !KqueueWatcher {
         blockWatchedSignals();
 
         var watcher: KqueueWatcher = .{ .kq = try posix.kqueue() };
@@ -533,7 +567,12 @@ const LinuxWatcher = struct {
         watched = 5,
     };
 
-    fn init(parent_pid: posix.pid_t, child_pid: posix.pid_t, watch_path: ?[]const u8, watch_pid: ?posix.pid_t) !LinuxWatcher {
+    fn init(
+        parent_pid: posix.pid_t,
+        child_pid: posix.pid_t,
+        watch_path: ?[]const u8,
+        watch_pid: ?posix.pid_t,
+    ) !LinuxWatcher {
         blockWatchedSignals();
 
         var watcher: LinuxWatcher = .{ .epfd = try posix.epoll_create1(linux.EPOLL.CLOEXEC) };
@@ -715,4 +754,15 @@ test "parse rejects invalid watch pid" {
 test "parse rejects missing command" {
     try std.testing.expectError(error.MissingCommand, parseArgs(&.{}));
     try std.testing.expectError(error.MissingCommand, parseArgs(&.{"--"}));
+}
+
+test "versionLine renders version and git sha" {
+    var buf: [256]u8 = undefined;
+    const line = try versionLine(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, line, "janitor "));
+    // The configured version and sha are both interpolated, wrapped in parens.
+    try std.testing.expect(std.mem.indexOf(u8, line, version) != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, git_sha) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '(') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, ')') != null);
 }

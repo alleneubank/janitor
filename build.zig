@@ -1,14 +1,27 @@
 const std = @import("std");
 
+// Single source of truth for the package version; the build_info options module
+// re-exports it so the lib, executable, and release archives never drift.
+const zon = @import("build.zig.zon");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Build metadata surfaced by `janitor --version` / `janitor version`. The
+    // git sha lets a deployed binary be matched back to its source commit.
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", zon.version);
+    build_info.addOption([]const u8, "git_sha", resolveGitSha(b));
 
     // Library module (exposed to package consumers)
     const mod = b.addModule("janitor", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    // root.zig reads version/git_sha from here; the import travels with the
+    // module to every consumer (exe, unit tests, package dependents).
+    mod.addImport("build_info", build_info.createModule());
 
     // Executable
     const exe = b.addExecutable(.{
@@ -76,4 +89,19 @@ pub fn build(b: *std.Build) void {
     const fmt_step = b.step("fmt", "Check source formatting");
     const fmt = b.addFmt(.{ .paths = &.{ "src", "build.zig" } });
     fmt_step.dependOn(&fmt.step);
+}
+
+// Resolves the short git commit at configure time, degrading to "unknown"
+// outside a git checkout (e.g. building from a release source tarball) so the
+// build never fails just because git is unavailable.
+fn resolveGitSha(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const raw = b.runAllowFail(
+        &.{ "git", "-C", b.build_root.path orelse ".", "rev-parse", "--short", "HEAD" },
+        &code,
+        .Ignore,
+    ) catch return "unknown";
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return "unknown";
+    return b.dupe(trimmed);
 }
