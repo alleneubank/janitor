@@ -40,6 +40,13 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    const cc_hook_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cc_hook.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cc_hook_tests).step);
+
     const e2e_exe = b.addExecutable(.{
         .name = "janitor-e2e",
         .root_module = b.createModule(.{
