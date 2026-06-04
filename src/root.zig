@@ -110,6 +110,8 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
 
     const child_pid = child.id;
     const child_pgid = child_pid;
+    var terminal_foreground = claimTerminalForeground(posix.STDIN_FILENO, child_pgid);
+    defer restoreTerminalForeground(&terminal_foreground);
 
     var child_state: ChildState = .running;
     var watcher = Watcher.init(original_parent, child_pid, config.watch_path) catch return error.WaitFailed;
@@ -204,6 +206,100 @@ fn signalProcessGroup(pgid: posix.pid_t, signal: u8) void {
         else => {},
     };
 }
+
+const TerminalForeground = struct {
+    fd: posix.fd_t,
+    original_pgid: posix.pid_t,
+    active: bool = true,
+
+    fn restore(self: *TerminalForeground) void {
+        if (!self.active) return;
+        self.active = false;
+        _ = tcSetForeground(self.fd, self.original_pgid);
+    }
+};
+
+fn restoreTerminalForeground(foreground: *?TerminalForeground) void {
+    if (foreground.*) |*state| state.restore();
+}
+
+fn claimTerminalForeground(fd: posix.fd_t, child_pgid: posix.pid_t) ?TerminalForeground {
+    if (!posix.isatty(fd)) return null;
+
+    const original_pgid = tcGetForeground(fd) orelse return null;
+    if (!tcSetForeground(fd, child_pgid)) return null;
+
+    return .{
+        .fd = fd,
+        .original_pgid = original_pgid,
+    };
+}
+
+fn tcGetForeground(fd: posix.fd_t) ?posix.pid_t {
+    switch (builtin.os.tag) {
+        .linux => {
+            var pgrp: posix.pid_t = undefined;
+            while (true) {
+                const rc = std.os.linux.tcgetpgrp(fd, &pgrp);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return pgrp,
+                    .INTR => continue,
+                    else => return null,
+                }
+            }
+        },
+        else => {
+            while (true) {
+                const pgrp = tcgetpgrp(@intCast(fd));
+                switch (posix.errno(pgrp)) {
+                    .SUCCESS => return pgrp,
+                    .INTR => continue,
+                    else => return null,
+                }
+            }
+        },
+    }
+}
+
+fn tcSetForeground(fd: posix.fd_t, pgid: posix.pid_t) bool {
+    // Reclaiming the terminal from a background process group (the restore path)
+    // would deliver SIGTTOU and stop janitor, so block it strictly around the
+    // call and restore the exact prior mask. Scoping it here keeps SIGTTOU from
+    // leaking into janitor's wider supervision lifetime, including when the call
+    // below fails and no handoff is claimed.
+    var block = posix.sigemptyset();
+    posix.sigaddset(&block, posix.SIG.TTOU);
+    var previous: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &block, &previous);
+    defer posix.sigprocmask(posix.SIG.SETMASK, &previous, null);
+
+    switch (builtin.os.tag) {
+        .linux => {
+            var pgrp = pgid;
+            while (true) {
+                const rc = std.os.linux.tcsetpgrp(fd, &pgrp);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return true,
+                    .INTR => continue,
+                    else => return false,
+                }
+            }
+        },
+        else => {
+            while (true) {
+                const rc = tcsetpgrp(@intCast(fd), pgid);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return true,
+                    .INTR => continue,
+                    else => return false,
+                }
+            }
+        },
+    }
+}
+
+extern "c" fn tcgetpgrp(fd: c_int) posix.pid_t;
+extern "c" fn tcsetpgrp(fd: c_int, pgrp: posix.pid_t) c_int;
 
 pub fn isProcessGroupAlive(pgid: posix.pid_t) bool {
     posix.kill(-pgid, 0) catch |err| switch (err) {

@@ -83,10 +83,15 @@ fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: [
     };
 
     // `sh -c` (no exec) keeps sh as the session leader and janitor as its child,
-    // matching the real layout where janitor inherits the shell's terminal.
+    // matching the real layout where janitor inherits the shell's terminal. The
+    // trailing `sleep` keeps the session leader alive after janitor exits so the
+    // restored foreground group stays observable: were the leader to exit
+    // immediately, the kernel would tear down the session and reset the pty
+    // foreground before the parent could read it — exactly how a real shell
+    // outlives the wrapped command and reclaims its terminal.
     const janitor_cmd = try std.fmt.allocPrint(
         allocator,
-        "'{s}' --watch-path '{s}' --grace-ms 200 --poll-ms 20 -- sh '{s}'",
+        "'{s}' --watch-path '{s}' --grace-ms 200 --poll-ms 20 -- sh '{s}'; sleep 5",
         .{ janitor_exe, watch_path, runner_script },
     );
     defer allocator.free(janitor_cmd);
@@ -136,7 +141,13 @@ fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: [
     try waitForProcessGone(child_pgid, 3000);
 
     // ...and the previous foreground process group must be restored before exit.
-    try waitForForeground(master, leader_pid, 3000);
+    waitForForeground(master, leader_pid, 3000) catch |err| {
+        std.debug.print(
+            "interactive restore: leader pgid {d} never reclaimed tty foreground (saw {d})\n",
+            .{ leader_pid, tcgetpgrp(master) },
+        );
+        return err;
+    };
 }
 
 fn waitForForeground(master: c_int, expected: posix.pid_t, timeout_ms: u64) !void {
