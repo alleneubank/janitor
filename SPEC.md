@@ -15,6 +15,9 @@ group, watches for owner-death signals, and drains that group with
 - **Janitor**: the `janitor` process.
 - **Original parent**: `janitor`'s parent PID captured before spawning the child.
 - **Child process group**: the process group created for the target command.
+- **Controlling terminal**: the terminal `janitor` inherits on standard input
+  when launched interactively; its foreground process group governs keyboard
+  input and terminal-generated signal (`Ctrl-C`/`SIGINT`) delivery.
 - **Death trigger**: parent PID change, watched-path disappearance, or
   `TERM`/`INT`/`HUP` delivered to `janitor`.
 - **Grace window**: bounded delay after `SIGTERM` before `SIGKILL`.
@@ -56,6 +59,13 @@ group, watches for owner-death signals, and drains that group with
   `inotify`.
 - **REQ-JANITOR-012**: Supported event backends do not wake periodically while
   idle; timeout waits are used only for the configured teardown grace window.
+- **REQ-JANITOR-013**: When `janitor`'s standard input is a terminal, `janitor`
+  transfers terminal foreground ownership (`tcsetpgrp`) to the child process
+  group after the child is spawned, so an interactive child receives keyboard
+  input and terminal-generated signals (`Ctrl-C`) directly rather than through
+  `janitor`'s grace-windowed teardown; `janitor` restores the previously
+  foreground process group before it exits. When standard input is not a
+  terminal, `janitor` leaves terminal state untouched.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, signs the binary with a Developer ID Application
   certificate, packages README and LICENSE beside the binary, and submits the
@@ -84,6 +94,8 @@ group, watches for owner-death signals, and drains that group with
 ## Invariants
 
 - `janitor` only signals the process group it created.
+- `janitor` blocks `SIGTTOU` around `tcsetpgrp` so reclaiming the controlling
+  terminal from a background process group cannot stop `janitor`.
 - `janitor` does not try to kill processes that escape into a different session
   or process group.
 - Cleanup logic is idempotent; `ESRCH` while signaling means the group already
@@ -99,6 +111,9 @@ group, watches for owner-death signals, and drains that group with
 ## Non-Goals
 
 - No daemon, launchd agent, cgroup manager, or persistent process registry.
+- `janitor` does not allocate a pseudo-terminal or proxy child I/O; it only
+  transfers foreground ownership of the controlling terminal it already
+  inherited on standard input.
 - No Windows support in this implementation.
 - `--poll-ms` remains accepted for CLI compatibility, but it is not the idle
   wait mechanism on supported event backends.
@@ -119,6 +134,11 @@ group, watches for owner-death signals, and drains that group with
 - [x] `zig build test` runs unit tests and the e2e process tests.
 - [x] `zig build fmt` passes.
 - [x] Supported platforms use kqueue/epoll event waits instead of idle polling.
+- [ ] With a controlling terminal, the child process group becomes the
+      terminal's foreground process group after spawn, and the original
+      foreground process group is restored after teardown.
+- [ ] Non-terminal standard input leaves terminal foreground state untouched
+      (the `sh`-based teardown e2e tests keep passing unchanged).
 - [x] Local macOS release automation has a syntax check and dry-run path.
 - [x] Draft GitHub Release automation builds ReleaseSafe archives for common
       Linux and macOS targets with SHA-256 checksums.
@@ -139,6 +159,7 @@ group, watches for owner-death signals, and drains that group with
 - REQ-JANITOR-009: `src/e2e.zig` `testNormalExit`.
 - REQ-JANITOR-010, REQ-JANITOR-011, REQ-JANITOR-012: `src/root.zig` watcher
   backend selection, plus native and cross-target builds.
+- REQ-JANITOR-013: `src/e2e.zig` `testInteractiveForegroundHandoff`.
 - REQ-RELEASE-001, REQ-RELEASE-002, REQ-RELEASE-003, REQ-RELEASE-004:
   `scripts/release-macos.sh`, `sh -n scripts/release-macos.sh`, and
   `scripts/release-macos.sh --dry-run --skip-sign --skip-notarize`.
