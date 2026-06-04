@@ -18,8 +18,8 @@ group, watches for owner-death signals, and drains that group with
 - **Controlling terminal**: the terminal `janitor` inherits on standard input
   when launched interactively; its foreground process group governs keyboard
   input and terminal-generated signal (`Ctrl-C`/`SIGINT`) delivery.
-- **Death trigger**: parent PID change, watched-path disappearance, or
-  `TERM`/`INT`/`HUP` delivered to `janitor`.
+- **Death trigger**: parent PID change, watched-path disappearance,
+  watched-PID exit, or `TERM`/`INT`/`HUP` delivered to `janitor`.
 - **Grace window**: bounded delay after `SIGTERM` before `SIGKILL`.
 - **Release artifact**: a versioned archive containing the `janitor` binary,
   README, LICENSE, and checksum material for GitHub Releases.
@@ -32,8 +32,8 @@ group, watches for owner-death signals, and drains that group with
 ## Requirements
 
 - **REQ-JANITOR-001**: The CLI accepts
-  `--watch-path PATH`, `--grace-ms MS`, `--poll-ms MS`, and requires `--` before
-  the command.
+  `--watch-path PATH`, `--watch-pid PID`, `--grace-ms MS`, `--poll-ms MS`, and
+  requires `--` before the command.
 - **REQ-JANITOR-002**: The child command runs in a new process group whose PGID
   is the child PID.
 - **REQ-JANITOR-003**: If the original parent PID changes, `janitor` tears down
@@ -53,10 +53,10 @@ group, watches for owner-death signals, and drains that group with
 - **REQ-JANITOR-009**: `janitor` exits with the direct child's status when the
   child status is available, encoding signal deaths as `128 + signal`.
 - **REQ-JANITOR-010**: On macOS/BSD, parent exit, child exit, watched-path
-  deletion, and shutdown signals are watched through `kqueue`.
+  deletion, watched-PID exit, and shutdown signals are watched through `kqueue`.
 - **REQ-JANITOR-011**: On Linux, parent exit, child exit, watched-path deletion,
-  and shutdown signals are watched through `epoll` over `pidfd`, `signalfd`, and
-  `inotify`.
+  watched-PID exit, and shutdown signals are watched through `epoll` over
+  `pidfd`, `signalfd`, and `inotify`.
 - **REQ-JANITOR-012**: Supported event backends do not wake periodically while
   idle; timeout waits are used only for the configured teardown grace window.
 - **REQ-JANITOR-013**: When `janitor`'s standard input is a terminal, `janitor`
@@ -66,6 +66,8 @@ group, watches for owner-death signals, and drains that group with
   `janitor`'s grace-windowed teardown; `janitor` restores the previously
   foreground process group before it exits. When standard input is not a
   terminal, `janitor` leaves terminal state untouched.
+- **REQ-JANITOR-014**: If the `--watch-pid` PID exits, `janitor` tears down the
+  child process group.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, signs the binary with a Developer ID Application
   certificate, packages README and LICENSE beside the binary, and submits the
@@ -131,6 +133,8 @@ group, watches for owner-death signals, and drains that group with
 - [x] Sending `SIGTERM` to `janitor` kills a TERM-ignoring descendant with
       `SIGKILL`.
 - [x] Parent process exit kills a TERM-ignoring descendant with `SIGKILL`.
+- [x] Killing a `--watch-pid` process kills a TERM-ignoring descendant with
+      `SIGKILL`.
 - [x] `zig build test` runs unit tests and the e2e process tests.
 - [x] `zig build fmt` passes.
 - [x] Supported platforms use kqueue/epoll event waits instead of idle polling.
@@ -156,6 +160,8 @@ group, watches for owner-death signals, and drains that group with
   `src/e2e.zig` `testSignalKillsProcessGroup`.
 - REQ-JANITOR-003, REQ-JANITOR-006, REQ-JANITOR-007:
   `src/e2e.zig` `testParentDeathKillsProcessGroup`.
+- REQ-JANITOR-014: `src/root.zig` parse tests, `src/e2e.zig`
+  `testWatchPidKillsProcessGroup`.
 - REQ-JANITOR-009: `src/e2e.zig` `testNormalExit`.
 - REQ-JANITOR-010, REQ-JANITOR-011, REQ-JANITOR-012: `src/root.zig` watcher
   backend selection, plus native and cross-target builds.

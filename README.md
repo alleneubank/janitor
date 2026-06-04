@@ -53,7 +53,7 @@ JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 ## Usage
 
 ```sh
-janitor [--watch-path PATH] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
 ```
 
 Examples:
@@ -67,6 +67,11 @@ janitor --grace-ms 500 -- tilt up
 `--watch-path` is useful for worktree-based development. If the worktree is
 deleted or moved, `janitor` treats that as a teardown trigger.
 
+`--watch-pid` watches an arbitrary process by PID. When that process exits,
+`janitor` treats it as a teardown trigger. This is useful when the supervised
+command is reparented away from `janitor`, so watching the owning process
+directly is more reliable than relying on `janitor`'s immediate parent.
+
 `--poll-ms` is accepted for compatibility with earlier development builds. On
 supported platforms, the active watcher is event-driven and does not use
 periodic idle polling.
@@ -75,6 +80,8 @@ periodic idle polling.
 
 - macOS and BSD use `kqueue` for process, signal, vnode, and timeout waits.
 - Linux uses `epoll` over `pidfd`, `signalfd`, and `inotify`.
+- Process watches, including the original parent, child, and any `--watch-pid`
+  target, use `EVFILT_PROC` / `NOTE_EXIT` on macOS/BSD and `pidfd` on Linux.
 - Windows is not supported.
 
 The child command is started in a new process group. Teardown only signals that

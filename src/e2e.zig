@@ -34,6 +34,7 @@ pub fn main() !void {
     const janitor_exe = args[1];
     try testNormalExit(allocator, janitor_exe);
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
+    try testWatchPidKillsProcessGroup(allocator, janitor_exe);
     try testSignalKillsProcessGroup(allocator, janitor_exe);
     try testParentDeathKillsProcessGroup(allocator, janitor_exe);
     try testInteractiveForegroundHandoff(allocator, janitor_exe);
@@ -220,6 +221,66 @@ fn testWatchPathKillsProcessGroup(allocator: std.mem.Allocator, janitor_exe: []c
 
     const term = try child.wait();
     try expectExitedAny(term, "watch-path teardown exits instead of hanging");
+    try waitForProcessGone(stubborn_pid, 3000);
+}
+
+fn testWatchPidKillsProcessGroup(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    var sandbox = try Sandbox.init(allocator, "watch-pid");
+    defer sandbox.deinit();
+
+    const child_pid_path = try sandbox.path("child.pid");
+    const stubborn_script = try sandbox.writeScript("stubborn.sh",
+        \\trap "" TERM
+        \\while :; do sleep 1; done
+        \\
+    );
+    const runner_script = try Sandbox.writeScriptFmt(
+        \\sh "{s}" &
+        \\echo $! > "{s}"
+        \\wait
+        \\
+    , sandbox, "runner.sh", .{ stubborn_script, child_pid_path });
+
+    var doomed = std.process.Child.init(&.{ "sleep", "30" }, allocator);
+    doomed.stdin_behavior = .Ignore;
+    doomed.stdout_behavior = .Ignore;
+    doomed.stderr_behavior = .Inherit;
+    try doomed.spawn();
+
+    var doomed_reaped = false;
+    defer {
+        if (!doomed_reaped) {
+            posix.kill(doomed.id, posix.SIG.KILL) catch {};
+            _ = doomed.wait() catch {};
+        }
+    }
+
+    const doomed_pid_arg = try std.fmt.allocPrint(allocator, "{d}", .{doomed.id});
+    defer allocator.free(doomed_pid_arg);
+
+    var child = std.process.Child.init(&.{
+        janitor_exe,
+        "--watch-pid",
+        doomed_pid_arg,
+        "--grace-ms",
+        "150",
+        "--poll-ms",
+        "20",
+        "--",
+        "sh",
+        runner_script,
+    }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const stubborn_pid = try waitForPidFile(child_pid_path, 2000);
+    try posix.kill(doomed.id, posix.SIG.TERM);
+
+    try expectExitedAny(try child.wait(), "watch-pid teardown exits instead of hanging");
+    _ = try doomed.wait();
+    doomed_reaped = true;
     try waitForProcessGone(stubborn_pid, 3000);
 }
 

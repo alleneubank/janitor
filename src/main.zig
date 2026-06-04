@@ -31,11 +31,11 @@ fn printUsage(err: ?janitor.ParseError) void {
     }
 
     std.debug.print(
-        \\usage: janitor [--watch-path PATH] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+        \\usage: janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
         \\
         \\Runs CMD in a new process group. If janitor's parent changes, a watched
-        \\path disappears, or janitor receives TERM/INT/HUP, it drains the child
-        \\process group with SIGTERM, a grace window, then SIGKILL.
+        \\path disappears, a watched PID exits, or janitor receives TERM/INT/HUP,
+        \\it drains the child process group with SIGTERM, a grace window, then SIGKILL.
         \\
     , .{});
 }
