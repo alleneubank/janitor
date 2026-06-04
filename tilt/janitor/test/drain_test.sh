@@ -78,18 +78,24 @@ cat >"$tmp_dir/Tiltfile" <<EOF
 # -*- mode: Python -*-
 load('../../Tiltfile', 'janitor_local_resource')
 
+# serve_cmd is a list so the Starlark string needs no double-escaping: the
+# single-quoted argument carries literal $$ (the leader sh's PID) and double
+# quotes. List form also means one sh is spawned and it IS the process-group
+# leader janitor creates, so the PID it records equals the group's pgid.
 janitor_local_resource(
     'janitor-drain-sleeper',
-    cmd='true',
-    serve_cmd="sh -c 'trap \"\" TERM; echo \\\$\\\$ > \"$pid_file\"; while :; do sleep 1; done'",
+    serve_cmd=['sh', '-c', 'trap "" TERM; echo \$\$ > "$pid_file"; while :; do sleep 1; done'],
     grace_ms=1000,
     watch_path='$tmp_dir',
 )
 EOF
 
+# exec so tilt_pid is tilt itself, not a wrapping subshell. janitor's parent is
+# this tilt process; killing a subshell instead would leave tilt (and thus
+# janitor's parent) alive, so the group would never drain.
 (
   cd "$tmp_dir"
-  JANITOR_BIN="$janitor_bin" tilt up --stream >"$tilt_log" 2>&1
+  exec env JANITOR_BIN="$janitor_bin" tilt up --stream --port 0 >"$tilt_log" 2>&1
 ) &
 tilt_pid=$!
 
