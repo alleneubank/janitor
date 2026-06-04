@@ -16,7 +16,7 @@ extern "c" fn tcgetpgrp(fd: c_int) posix.pid_t;
 
 // TIOCSCTTY: make the freshly setsid()'d child claim the pty slave as its
 // controlling terminal, mirroring how a terminal emulator launches a shell.
-const TIOCSCTTY: c_int = switch (builtin.os.tag) {
+const tiocsctty: c_int = switch (builtin.os.tag) {
     .linux => 0x540E,
     else => 0x20007461, // darwin/BSD _IO('t', 97)
 };
@@ -104,9 +104,9 @@ fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: [
     const leader_pid = try posix.fork();
     if (leader_pid == 0) {
         // Session leader that owns the pty, like a terminal emulator's shell.
-        _ = posix.setsid() catch {};
+        _ = posix.setsid() catch posix.exit(80);
         const slave = posix.openZ(slave_name, .{ .ACCMODE = .RDWR }, 0) catch posix.exit(81);
-        _ = std.c.ioctl(slave, TIOCSCTTY, @as(c_int, 0));
+        _ = std.c.ioctl(slave, tiocsctty, @as(c_int, 0));
         posix.dup2(slave, 0) catch posix.exit(82);
         posix.dup2(slave, 1) catch posix.exit(83);
         posix.dup2(slave, 2) catch posix.exit(84);
@@ -160,7 +160,12 @@ fn waitForForeground(master: c_int, expected: posix.pid_t, timeout_ms: u64) !voi
 }
 
 fn killGroup(pgid: posix.pid_t) void {
-    posix.kill(-pgid, posix.SIG.KILL) catch {};
+    // Best-effort teardown of a leftover group; an already-drained group
+    // (ESRCH) is the expected, benign case.
+    posix.kill(-pgid, posix.SIG.KILL) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => {},
+    };
 }
 
 fn testNormalExit(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
