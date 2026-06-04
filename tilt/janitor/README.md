@@ -89,13 +89,19 @@ print(janitor_tilt_up_cmd())
 
 ## Auto-Install
 
-The extension resolves janitor once when the Tiltfile loads:
+The extension resolves janitor in this order:
 
-1. `JANITOR_BIN`
+1. a per-call `janitor_bin=` argument, or the `JANITOR_BIN` environment variable
 2. `janitor` on `PATH`
 3. `$PREFIX/bin/janitor` with `PREFIX` defaulting to `~/.local`
 4. auto-install through `install.sh`
 5. fail with install instructions
+
+Steps 1–3 run once when the Tiltfile loads. Auto-install (step 4) is deferred to
+the first wrapped resource, **after** any per-call `janitor_bin` is considered,
+so an explicit `janitor_bin` (or a binary already on `PATH`/`$PREFIX/bin`) is
+never preempted by a network install — offline and vendored projects can pin a
+binary and stay offline.
 
 Auto-install is on by default on macOS and Linux. Disable it with:
 

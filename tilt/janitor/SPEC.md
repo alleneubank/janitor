@@ -43,22 +43,30 @@ custom extension repo or vendored directly into a project.
   defaults to 5000.
 - **REQ-TILT-005**: the janitor binary is resolved in order from
   `janitor_bin` or `JANITOR_BIN`, `PATH`, `$PREFIX/bin`, auto-install, then an
-  actionable failure. Auto-install is on by default on macOS/Linux, drives
-  `install.sh` with SHA-256-verified release archives, honors
-  `JANITOR_VERSION` and `PREFIX`, is idempotent, and resolves to
-  `$PREFIX/bin/janitor`.
+  actionable failure. A per-call `janitor_bin` (or a binary already on
+  `PATH`/`$PREFIX/bin`) always wins and never triggers a network install:
+  auto-install is deferred to first wrapped use rather than run at module load,
+  so explicit and offline/vendored configurations are never preempted.
+  Auto-install is on by default on macOS/Linux, drives `install.sh` with
+  SHA-256-verified release archives, honors `JANITOR_VERSION` and `PREFIX`, is
+  idempotent, and resolves to `$PREFIX/bin/janitor`.
 - **REQ-TILT-006**: `JANITOR_AUTO_INSTALL=0` or an unsupported non-POSIX
   platform disables auto-install and yields a fail-fast install message; Windows
   and `*_bat` commands are not wrapped by this Unix-only extension.
 - **REQ-TILT-007**: `janitor_tilt_up_cmd()` returns the recommended outer guard
-  command string: `janitor ... -- tilt up`.
+  command string `janitor ... -- tilt up`, with the watch path shell-quoted so
+  it is safe to paste into a Makefile, justfile, or shell alias.
 
 ## Invariants
 
 - String command inputs preserve Tilt's shell semantics by remaining under
   `sh -c`.
 - List command inputs preserve argv semantics and are never shell-joined.
-- Binary lookup and auto-install are the only extension load-time side effects.
+- The only load-time side effect is a non-installing binary lookup
+  (`command -v` plus a `$PREFIX/bin` stat); the network auto-install runs lazily
+  at first wrapped use so an explicit `janitor_bin` is never preempted.
+- The outer-guard string shell-quotes the watch path so it cannot alter argv or
+  inject shell syntax when pasted into a shell.
 - `janitor_wrap` is deterministic for explicit `watch_path`, `grace_ms`, and
   `janitor_bin` inputs.
 - The extension never adds Windows batch command wrapping because janitor does
@@ -92,11 +100,14 @@ custom extension repo or vendored directly into a project.
 - REQ-TILT-004: `tilt/janitor/test/Tiltfile` asserts explicit grace and watch
   path behavior; `tilt/janitor/test/drain_test.sh` exercises the 5000 default
   through module load and a resource-level short override.
-- REQ-TILT-005: `tilt/janitor/test/Tiltfile` passes explicit `janitor_bin`, and
-  the acceptance command sets `JANITOR_BIN=/usr/bin/true` to cover the
-  environment override without PATH lookup or network.
-- REQ-TILT-006: `tilt/janitor/test/Tiltfile` documents the negative
-  `JANITOR_AUTO_INSTALL=0 PATH=` load case; non-POSIX platforms are guarded in
-  `tilt/janitor/test/drain_test.sh`.
+- REQ-TILT-005: `tilt/janitor/test/resolve_test.sh` case A proves an explicit
+  `janitor_bin` resolves in an isolated env (no janitor on PATH, empty
+  `$PREFIX`) without invoking the auto-installer, even with auto-install enabled;
+  `tilt/janitor/test/Tiltfile` passes explicit `janitor_bin` for argv assertions.
+- REQ-TILT-006: `tilt/janitor/test/resolve_test.sh` case B proves that with
+  janitor absent and `JANITOR_AUTO_INSTALL=0`, evaluation fails fast with the
+  actionable install message and never calls curl; non-POSIX platforms are
+  guarded in both test scripts.
 - REQ-TILT-007: `tilt/janitor/test/Tiltfile` asserts the exact
-  `janitor_tilt_up_cmd()` string.
+  `janitor_tilt_up_cmd()` string, including shell-quoting of watch paths that
+  contain spaces and single quotes.

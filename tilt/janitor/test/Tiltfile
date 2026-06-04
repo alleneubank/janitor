@@ -23,12 +23,28 @@ _expect(
     'custom grace',
 )
 
+# The outer-guard string shell-quotes the watch path so it is safe to paste
+# into a Makefile/shell even with spaces or metacharacters (REQ-TILT-007).
 _expect(
     janitor_tilt_up_cmd(grace_ms=5000, watch_path='/work'),
-    'janitor --watch-path /work --grace-ms 5000 -- tilt up',
+    "janitor --watch-path '/work' --grace-ms 5000 -- tilt up",
     'tilt up command',
 )
 
-# Negative case intentionally lives outside this load-test because it should
-# fail at module load: JANITOR_AUTO_INSTALL=0 PATH= tilt alpha tiltfile-result
-# -f tilt/janitor/Tiltfile exits non-zero with the actionable install message.
+_expect(
+    janitor_tilt_up_cmd(grace_ms=5000, watch_path='/a b'),
+    "janitor --watch-path '/a b' --grace-ms 5000 -- tilt up",
+    'tilt up command quotes spaces',
+)
+
+_expect(
+    janitor_tilt_up_cmd(grace_ms=5000, watch_path="/a'b"),
+    "janitor --watch-path '/a'\\''b' --grace-ms 5000 -- tilt up",
+    'tilt up command escapes single quote',
+)
+
+# Negative cases intentionally live outside this load-test (they fail at module
+# load) and are covered by tilt/janitor/test/resolve_test.sh:
+#  - JANITOR_AUTO_INSTALL=0 with janitor absent exits non-zero with the install
+#    message;
+#  - an explicit janitor_bin override never triggers auto-install.
