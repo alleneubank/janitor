@@ -10,9 +10,15 @@ pub fn build(b: *std.Build) void {
 
     // Build metadata surfaced by `janitor --version` / `janitor version`. The
     // git sha lets a deployed binary be matched back to its source commit.
+    const sha_override = b.option(
+        []const u8,
+        "git_sha",
+        "Embed this commit sha in the version banner. Release CI passes it so the " ++
+            "sha never depends on git being present inside the nix build shell.",
+    );
     const build_info = b.addOptions();
     build_info.addOption([]const u8, "version", zon.version);
-    build_info.addOption([]const u8, "git_sha", resolveGitSha(b));
+    build_info.addOption([]const u8, "git_sha", resolveGitSha(b, sha_override));
 
     // Library module (exposed to package consumers)
     const mod = b.addModule("janitor", .{
@@ -91,10 +97,16 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 }
 
-// Resolves the short git commit at configure time, degrading to "unknown"
-// outside a git checkout (e.g. building from a release source tarball) so the
-// build never fails just because git is unavailable.
-fn resolveGitSha(b: *std.Build) []const u8 {
+// Resolves the short git commit to embed in the version banner. An explicit
+// -Dgit_sha override wins (release CI passes the runner-computed sha so the
+// value never depends on git inside the nix shell). Otherwise it shells out to
+// git, degrading to "unknown" outside a git checkout (e.g. a release source
+// tarball) so the build never fails just because git is unavailable.
+fn resolveGitSha(b: *std.Build, override: ?[]const u8) []const u8 {
+    if (override) |sha| {
+        const trimmed = std.mem.trim(u8, sha, " \t\r\n");
+        if (trimmed.len > 0) return b.dupe(trimmed);
+    }
     var code: u8 = undefined;
     const raw = b.runAllowFail(
         &.{ "git", "-C", b.build_root.path orelse ".", "rev-parse", "--short", "HEAD" },
