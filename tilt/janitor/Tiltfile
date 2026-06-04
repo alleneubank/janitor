@@ -1,0 +1,100 @@
+# -*- mode: Python -*-
+DEFAULT_GRACE_MS = 5000  # Larger than janitor's 1500 CLI default: dev servers
+                         # need a beat to release ports/flush on SIGTERM.
+_INSTALL_SH = 'https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh'
+
+def _janitor_prefix():
+    # install.sh installs to $PREFIX/bin and defaults to ~/.local/bin.
+    return os.getenv('PREFIX') or ((os.getenv('HOME') or '') + '/.local')
+
+def _auto_install_enabled():
+    # janitor is Unix-only, so unsupported platforms fail with install guidance
+    # instead of running a shell installer that cannot produce a working binary.
+    if os.name != 'posix':
+        return False
+    return (os.getenv('JANITOR_AUTO_INSTALL') or '1') not in ['0', 'false', 'no']
+
+def _auto_install():
+    prefix = _janitor_prefix()
+    installed = prefix + '/bin/janitor'
+    version = os.getenv('JANITOR_VERSION') or 'latest'
+    warn('janitor: not found; auto-installing %s to %s/bin (JANITOR_AUTO_INSTALL=0 to disable)' % (version, prefix))
+    # install.sh performs host detection and verifies the release archive against
+    # the SHA-256 sidecar before placing janitor under $PREFIX/bin.
+    local('curl -fsSL %s | sh' % _INSTALL_SH, quiet=False, echo_off=True)
+    if not os.path.exists(installed):
+        fail('janitor: auto-install ran but %s is missing' % installed)
+    return installed
+
+def _resolve_janitor():
+    # Resolution is cached once per Tiltfile load. Per-resource janitor_bin
+    # overrides still work because missing global resolution returns '' and
+    # _require_janitor resolves the effective value at call time.
+    override = os.getenv('JANITOR_BIN') or ''
+    if override:
+        return override
+
+    onpath = str(local('command -v janitor || true', quiet=True, echo_off=True)).strip()
+    if onpath:
+        return onpath
+
+    installed = _janitor_prefix() + '/bin/janitor'
+    if os.path.exists(installed):
+        return installed
+
+    if _auto_install_enabled():
+        return _auto_install()
+
+    return ''
+
+_JANITOR_BIN = _resolve_janitor()
+
+def _require_janitor(janitor_bin):
+    jbin = janitor_bin or _JANITOR_BIN
+    if not jbin:
+        fail('\n'.join([
+            'janitor: binary not found on PATH.',
+            '',
+            'Install it:',
+            '  curl -fsSL https://raw.githubusercontent.com/alleneubank/janitor/main/install.sh | sh',
+            '',
+            'Or set JANITOR_BIN=/path/to/janitor (or pass janitor_bin=...),',
+            'or enable auto-install (JANITOR_AUTO_INSTALL=1, on by default on macOS/Linux).',
+        ]))
+    return jbin
+
+def janitor_wrap(command, grace_ms=DEFAULT_GRACE_MS, watch_path=None, janitor_bin=None):
+    # Keep wrapping pure: callers can assert the exact argv without creating Tilt
+    # resources, while all install/PATH side effects stay in binary resolution.
+    jbin = _require_janitor(janitor_bin)
+    path = watch_path or config.main_dir
+    prefix = [jbin, '--watch-path', path, '--grace-ms', '%d' % int(grace_ms), '--']
+    t = type(command)
+    if t == 'string':
+        # Tilt runs string commands through sh -c; preserve that shell contract
+        # while making janitor the owner of the spawned process group.
+        return prefix + ['sh', '-c', command]
+    elif t == 'list':
+        # List commands already represent argv, so adding a shell would change
+        # quoting and signal behavior.
+        return prefix + command
+    fail('janitor_wrap: command must be a string or list, got %s' % t)
+
+def janitor_local_resource(name, cmd=None, serve_cmd=None,
+                           grace_ms=DEFAULT_GRACE_MS, watch_path=None,
+                           wrap_serve_cmd=True, wrap_cmd=False,
+                           janitor_bin=None, **kwargs):
+    # Mirror local_resource's call shape: only command fields the caller supplied
+    # are set, and every other kwarg is forwarded without interpretation.
+    args = dict(**kwargs)
+    if serve_cmd != None:
+        args['serve_cmd'] = janitor_wrap(serve_cmd, grace_ms, watch_path, janitor_bin) if wrap_serve_cmd else serve_cmd
+    if cmd != None:
+        args['cmd'] = janitor_wrap(cmd, grace_ms, watch_path, janitor_bin) if wrap_cmd else cmd
+    return local_resource(name, **args)
+
+def janitor_tilt_up_cmd(grace_ms=DEFAULT_GRACE_MS, watch_path=None):
+    # A Tiltfile cannot re-exec its own running Tilt process; expose the command
+    # string for Makefiles, justfiles, shell aliases, or README snippets.
+    path = watch_path or config.main_dir
+    return 'janitor --watch-path %s --grace-ms %d -- tilt up' % (path, int(grace_ms))

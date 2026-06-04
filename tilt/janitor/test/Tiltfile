@@ -1,0 +1,34 @@
+# -*- mode: Python -*-
+load('../Tiltfile', 'janitor_wrap', 'janitor_tilt_up_cmd')
+
+def _expect(actual, expected, label):
+    if actual != expected:
+        fail('%s mismatch:\nactual: %s\nexpected: %s' % (label, actual, expected))
+
+_expect(
+    janitor_wrap('anvil --host 0.0.0.0', grace_ms=5000, watch_path='/work', janitor_bin='janitor'),
+    ['janitor', '--watch-path', '/work', '--grace-ms', '5000', '--', 'sh', '-c', 'anvil --host 0.0.0.0'],
+    'string command',
+)
+
+_expect(
+    janitor_wrap(['anvil', '--host', '0.0.0.0'], grace_ms=5000, watch_path='/work', janitor_bin='janitor'),
+    ['janitor', '--watch-path', '/work', '--grace-ms', '5000', '--', 'anvil', '--host', '0.0.0.0'],
+    'list command',
+)
+
+_expect(
+    janitor_wrap('x', grace_ms=250, watch_path='/work', janitor_bin='janitor')[3:5],
+    ['--grace-ms', '250'],
+    'custom grace',
+)
+
+_expect(
+    janitor_tilt_up_cmd(grace_ms=5000, watch_path='/work'),
+    'janitor --watch-path /work --grace-ms 5000 -- tilt up',
+    'tilt up command',
+)
+
+# Negative case intentionally lives outside this load-test because it should
+# fail at module load: JANITOR_AUTO_INSTALL=0 PATH= tilt alpha tiltfile-result
+# -f tilt/janitor/Tiltfile exits non-zero with the actionable install message.
