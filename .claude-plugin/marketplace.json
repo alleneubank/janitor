@@ -1,0 +1,15 @@
+{
+  "name": "janitor",
+  "description": "janitor: supervise and drain session-spawned process groups",
+  "owner": {
+    "name": "Allen Eubank",
+    "email": "allen@send.it"
+  },
+  "plugins": [
+    {
+      "name": "janitor-bash-drain",
+      "description": "Wrap the Bash tool with janitor so processes a Claude Code session starts are drained when the session ends.",
+      "source": "./plugin"
+    }
+  ]
+}
