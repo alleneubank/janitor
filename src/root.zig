@@ -5,7 +5,7 @@ const std = @import("std");
 
 const posix = std.posix;
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 
 const default_grace_ms: u64 = 1500;
 const default_poll_ms: u64 = 100;
