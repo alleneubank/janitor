@@ -46,6 +46,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/e2e.zig"),
             .target = target,
             .optimize = optimize,
+            // The e2e harness drives a pty via libc terminal calls (posix_openpt,
+            // tcgetpgrp, ...) to observe terminal foreground ownership.
+            .link_libc = true,
         }),
     });
     const run_e2e = b.addRunArtifact(e2e_exe);

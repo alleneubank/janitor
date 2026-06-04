@@ -1,8 +1,25 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const posix = std.posix;
 
 const TimeoutError = error{Timeout};
+
+// std.posix.tcsetpgrp/tcgetpgrp reference std.c.tc*pgrp, which is not declared
+// for macOS in Zig 0.15.2, so the test harness calls the libc symbols directly.
+// These are standard POSIX terminal calls present in macOS libSystem and glibc.
+extern "c" fn posix_openpt(flags: c_int) c_int;
+extern "c" fn grantpt(fd: c_int) c_int;
+extern "c" fn unlockpt(fd: c_int) c_int;
+extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
+extern "c" fn tcgetpgrp(fd: c_int) posix.pid_t;
+
+// TIOCSCTTY: make the freshly setsid()'d child claim the pty slave as its
+// controlling terminal, mirroring how a terminal emulator launches a shell.
+const TIOCSCTTY: c_int = switch (builtin.os.tag) {
+    .linux => 0x540E,
+    else => 0x20007461, // darwin/BSD _IO('t', 97)
+};
 
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
@@ -19,6 +36,120 @@ pub fn main() !void {
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
     try testSignalKillsProcessGroup(allocator, janitor_exe);
     try testParentDeathKillsProcessGroup(allocator, janitor_exe);
+    try testInteractiveForegroundHandoff(allocator, janitor_exe);
+}
+
+// REQ-JANITOR-013: with a controlling terminal, janitor must hand terminal
+// foreground ownership to the child process group (so the child receives
+// keyboard input and Ctrl-C directly), then restore the previous foreground
+// group on teardown. Reproduces an interactive launch by running janitor under
+// a pty whose foreground group we observe through the master via tcgetpgrp.
+fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    var sandbox = try Sandbox.init(allocator, "fg-handoff");
+    defer sandbox.deinit();
+
+    const watch_path = try sandbox.path("watch");
+    const child_pid_path = try sandbox.path("child.pid");
+
+    // janitor's direct child leads the new process group, so its own $$ is the
+    // process-group id we expect to see take over the terminal foreground.
+    const runner_script = try Sandbox.writeScriptFmt(
+        \\echo $$ > "{s}"
+        \\sleep 30
+        \\
+    , sandbox, "runner.sh", .{child_pid_path});
+
+    try std.fs.cwd().writeFile(.{ .sub_path = watch_path, .data = "" });
+
+    // Allocate a pty; the parent keeps the master purely to observe the slave's
+    // foreground process group. tcgetpgrp/tcsetpgrp from the parent would fail
+    // (the pty is not the parent's controlling terminal), so only the in-session
+    // janitor can change foreground ownership — exactly what we are testing.
+    const o_rdwr: c_int = 0o2;
+    const master = posix_openpt(o_rdwr);
+    if (master < 0) return error.OpenPtFailed;
+    defer posix.close(master);
+    if (grantpt(master) != 0) return error.GrantPtFailed;
+    if (unlockpt(master) != 0) return error.UnlockPtFailed;
+
+    var slave_buf: [128]u8 = undefined;
+    const slave_name = blk: {
+        const raw = ptsname(master) orelse return error.PtsNameFailed;
+        const span = std.mem.span(raw);
+        if (span.len + 1 > slave_buf.len) return error.PtsNameTooLong;
+        @memcpy(slave_buf[0..span.len], span);
+        slave_buf[span.len] = 0;
+        break :blk slave_buf[0..span.len :0];
+    };
+
+    // `sh -c` (no exec) keeps sh as the session leader and janitor as its child,
+    // matching the real layout where janitor inherits the shell's terminal.
+    const janitor_cmd = try std.fmt.allocPrint(
+        allocator,
+        "'{s}' --watch-path '{s}' --grace-ms 200 --poll-ms 20 -- sh '{s}'",
+        .{ janitor_exe, watch_path, runner_script },
+    );
+    defer allocator.free(janitor_cmd);
+    const janitor_cmd_z = try allocator.dupeZ(u8, janitor_cmd);
+    defer allocator.free(janitor_cmd_z);
+
+    const argv = [_:null]?[*:0]const u8{ "sh", "-c", janitor_cmd_z, null };
+    const envp = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin:/usr/local/bin", null };
+
+    const leader_pid = try posix.fork();
+    if (leader_pid == 0) {
+        // Session leader that owns the pty, like a terminal emulator's shell.
+        _ = posix.setsid() catch {};
+        const slave = posix.openZ(slave_name, .{ .ACCMODE = .RDWR }, 0) catch posix.exit(81);
+        _ = std.c.ioctl(slave, TIOCSCTTY, @as(c_int, 0));
+        posix.dup2(slave, 0) catch posix.exit(82);
+        posix.dup2(slave, 1) catch posix.exit(83);
+        posix.dup2(slave, 2) catch posix.exit(84);
+        if (slave > 2) posix.close(slave);
+        posix.close(master);
+        const exec_err = posix.execvpeZ("sh", &argv, &envp);
+        std.debug.print("e2e session leader exec failed: {s}\n", .{@errorName(exec_err)});
+        posix.exit(85);
+    }
+
+    // Reap the session leader and nuke any survivors regardless of pass/fail —
+    // janitor's own test must not leak the processes it is meant to clean up.
+    defer {
+        killGroup(leader_pid);
+        _ = posix.waitpid(leader_pid, 0);
+    }
+
+    const child_pgid = try waitForPidFile(child_pid_path, 5000);
+    defer killGroup(child_pgid);
+
+    // Foreground ownership must move to the child's process group.
+    waitForForeground(master, child_pgid, 4000) catch |err| {
+        std.debug.print(
+            "interactive handoff: child pgid {d} never became tty foreground (saw {d})\n",
+            .{ child_pgid, tcgetpgrp(master) },
+        );
+        return err;
+    };
+
+    // Teardown via watch-path removal must still drain the child group...
+    try std.fs.cwd().deleteFile(watch_path);
+    try waitForProcessGone(child_pgid, 3000);
+
+    // ...and the previous foreground process group must be restored before exit.
+    try waitForForeground(master, leader_pid, 3000);
+}
+
+fn waitForForeground(master: c_int, expected: posix.pid_t, timeout_ms: u64) !void {
+    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    while (monotonicNowNs() < deadline_ns) {
+        if (tcgetpgrp(master) == expected) return;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+fn killGroup(pgid: posix.pid_t) void {
+    posix.kill(-pgid, posix.SIG.KILL) catch {};
 }
 
 fn testNormalExit(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
