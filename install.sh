@@ -78,12 +78,40 @@ run() {
 }
 
 tmp_dir=""
+staged_bin=""
 cleanup() {
   if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
     rm -rf "$tmp_dir"
   fi
+  # Remove a half-installed staged binary if install_binary failed before its
+  # rename completed (a successful mv clears staged_bin, so this is a no-op then).
+  if [ -n "$staged_bin" ] && [ -e "$staged_bin" ]; then
+    rm -f "$staged_bin"
+  fi
 }
 trap cleanup EXIT INT TERM
+
+# Install a binary to its destination atomically. A plain `cp` over an existing
+# executable rewrites it in place (same inode). On macOS, if that binary is
+# concurrently executed -- which the Claude Code plugin does on every Bash
+# command via `janitor cc-hook` -- the kernel's per-inode code-signature cache
+# is invalidated mid-write and subsequent execs are SIGKILLed ("Killed: 9").
+# Staging into the destination directory and renaming swaps in a fresh inode, so
+# concurrent execs always see a fully valid old-or-new binary, never a torn one.
+install_binary() {
+  src="$1"
+  dest="$2"
+  dest_dir="$(dirname "$dest")"
+  mkdir -p "$dest_dir"
+  # Stage in the destination directory so `mv` is a same-filesystem rename(2),
+  # which is atomic; a cross-filesystem mv would copy-then-unlink and reintroduce
+  # the in-place overwrite this function exists to avoid.
+  staged_bin="$(mktemp "$dest_dir/.janitor.install.XXXXXX")"
+  cp "$src" "$staged_bin"
+  chmod 0755 "$staged_bin"
+  mv -f "$staged_bin" "$dest"
+  staged_bin=""
+}
 
 install_from_release() {
   need curl
@@ -148,9 +176,7 @@ install_from_release() {
   binary="$(find "$unpack_dir" -type f -name janitor -perm -111 | sed -n '1p')"
   [ -n "$binary" ] || die "archive did not contain an executable janitor binary"
 
-  mkdir -p "$prefix/bin"
-  cp "$binary" "$prefix/bin/janitor"
-  chmod 0755 "$prefix/bin/janitor"
+  install_binary "$binary" "$prefix/bin/janitor"
 }
 
 install_from_source_tree() {
@@ -171,7 +197,11 @@ install_from_source_tree() {
   echo "install prefix: $prefix"
 
   cd "$src_dir"
-  zig build -Doptimize="$optimize" --prefix "$prefix"
+  # Build into the default zig-out, then install atomically. Using `zig build
+  # --prefix` would install the binary in place, which is unsafe while the
+  # janitor binary is being executed concurrently (see install_binary).
+  zig build -Doptimize="$optimize"
+  install_binary "$src_dir/zig-out/bin/janitor" "$prefix/bin/janitor"
 }
 
 case "$install_from_source" in

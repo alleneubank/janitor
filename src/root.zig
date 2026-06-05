@@ -2,16 +2,34 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+// Build-time metadata: version single-sourced from build.zig.zon, git_sha
+// resolved during `zig build`. See build.zig.
+const build_info = @import("build_info");
 
 const posix = std.posix;
 
-pub const version = "0.1.1";
+/// Package version, single-sourced from build.zig.zon so the lib, executable,
+/// and release archives never drift.
+pub const version = build_info.version;
+
+/// Short git commit the binary was built from, or "unknown" when built outside
+/// a git checkout (e.g. from a release source tarball).
+pub const git_sha = build_info.git_sha;
+
+/// REQ-JANITOR-015: formats the version banner ("janitor <version> (<sha>)")
+/// into `buf` and returns the written slice (no trailing newline). Buffer-based
+/// rather than writer-based so the executable's stdout path and the unit test
+/// share one formatting routine; 256 bytes is ample for a semver and short sha.
+pub fn versionLine(buf: []u8) std.fmt.BufPrintError![]const u8 {
+    return std.fmt.bufPrint(buf, "janitor {s} ({s})", .{ version, git_sha });
+}
 
 const default_grace_ms: u64 = 1500;
 const default_poll_ms: u64 = 100;
 
 pub const Config = struct {
     watch_path: ?[]const u8 = null,
+    watch_pid: ?posix.pid_t = null,
     grace_ms: u64 = default_grace_ms,
     poll_ms: u64 = default_poll_ms,
     command: []const []const u8,
@@ -37,6 +55,7 @@ const ChildState = union(enum) {
 
 const TeardownReason = enum {
     parent_exited,
+    watched_pid_exited,
     path_missing,
     signal,
     child_exited,
@@ -44,6 +63,7 @@ const TeardownReason = enum {
 
 const WatchEvent = union(enum) {
     parent_exited,
+    watched_pid_exited,
     child_exited,
     path_missing,
     signal: u8,
@@ -58,6 +78,7 @@ const Watcher = switch (builtin.os.tag) {
 
 pub fn parseArgs(args: []const []const u8) ParseError!Config {
     var watch_path: ?[]const u8 = null;
+    var watch_pid: ?posix.pid_t = null;
     var grace_ms = default_grace_ms;
     var poll_ms = default_poll_ms;
 
@@ -69,6 +90,7 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             if (command.len == 0) return error.MissingCommand;
             return .{
                 .watch_path = watch_path,
+                .watch_pid = watch_pid,
                 .grace_ms = grace_ms,
                 .poll_ms = poll_ms,
                 .command = command,
@@ -77,6 +99,12 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             watch_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--watch-pid")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            const pid = std.fmt.parseInt(posix.pid_t, args[i], 10) catch return error.InvalidNumber;
+            if (pid <= 0) return error.InvalidNumber;
+            watch_pid = pid;
         } else if (std.mem.eql(u8, arg, "--grace-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
@@ -114,7 +142,12 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
     defer restoreTerminalForeground(&terminal_foreground);
 
     var child_state: ChildState = .running;
-    var watcher = Watcher.init(original_parent, child_pid, config.watch_path) catch return error.WaitFailed;
+    var watcher = Watcher.init(
+        original_parent,
+        child_pid,
+        config.watch_path,
+        config.watch_pid,
+    ) catch return error.WaitFailed;
     defer watcher.deinit();
 
     if (getParentPid() != original_parent) {
@@ -125,6 +158,14 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
         const event = watcher.wait(null) catch return error.WaitFailed;
         switch (event) {
             .parent_exited => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .parent_exited),
+            .watched_pid_exited => return teardown(
+                child_pid,
+                child_pgid,
+                config,
+                &watcher,
+                &child_state,
+                .watched_pid_exited,
+            ),
             .path_missing => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .path_missing),
             .signal => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .signal),
             .child_exited => {
@@ -385,9 +426,15 @@ const KqueueWatcher = struct {
         child = 2,
         signal = 3,
         path = 4,
+        watched = 5,
     };
 
-    fn init(parent_pid: posix.pid_t, child_pid: posix.pid_t, watch_path: ?[]const u8) !KqueueWatcher {
+    fn init(
+        parent_pid: posix.pid_t,
+        child_pid: posix.pid_t,
+        watch_path: ?[]const u8,
+        watch_pid: ?posix.pid_t,
+    ) !KqueueWatcher {
         blockWatchedSignals();
 
         var watcher: KqueueWatcher = .{ .kq = try posix.kqueue() };
@@ -401,6 +448,12 @@ const KqueueWatcher = struct {
             error.ProcessNotFound => watcher.pending.put(.child_exited),
             else => return err,
         };
+        if (watch_pid) |pid| {
+            watcher.addProc(pid, .watched) catch |err| switch (err) {
+                error.ProcessNotFound => watcher.pending.put(.watched_pid_exited),
+                else => return err,
+            };
+        }
         try watcher.addSignal(posix.SIG.TERM);
         try watcher.addSignal(posix.SIG.INT);
         try watcher.addSignal(posix.SIG.HUP);
@@ -443,6 +496,7 @@ const KqueueWatcher = struct {
             .child => .child_exited,
             .signal => .{ .signal = @intCast(event.ident) },
             .path => .path_missing,
+            .watched => .watched_pid_exited,
         };
     }
 
@@ -499,6 +553,7 @@ const LinuxWatcher = struct {
     epfd: i32,
     parent_fd: ?posix.fd_t = null,
     child_fd: ?posix.fd_t = null,
+    watched_fd: ?posix.fd_t = null,
     signal_fd: ?posix.fd_t = null,
     inotify_fd: ?posix.fd_t = null,
     pending: PendingEvent = .{},
@@ -509,9 +564,15 @@ const LinuxWatcher = struct {
         child = 2,
         signal = 3,
         path = 4,
+        watched = 5,
     };
 
-    fn init(parent_pid: posix.pid_t, child_pid: posix.pid_t, watch_path: ?[]const u8) !LinuxWatcher {
+    fn init(
+        parent_pid: posix.pid_t,
+        child_pid: posix.pid_t,
+        watch_path: ?[]const u8,
+        watch_pid: ?posix.pid_t,
+    ) !LinuxWatcher {
         blockWatchedSignals();
 
         var watcher: LinuxWatcher = .{ .epfd = try posix.epoll_create1(linux.EPOLL.CLOEXEC) };
@@ -535,6 +596,18 @@ const LinuxWatcher = struct {
         };
         if (watcher.child_fd) |fd| try watcher.addFd(fd, .child);
 
+        watcher.watched_fd = if (watch_pid) |pid|
+            linuxPidfdOpen(pid) catch |err| switch (err) {
+                error.ProcessNotFound => blk: {
+                    watcher.pending.put(.watched_pid_exited);
+                    break :blk null;
+                },
+                else => return err,
+            }
+        else
+            null;
+        if (watcher.watched_fd) |fd| try watcher.addFd(fd, .watched);
+
         var mask = watchedSignalSet();
         watcher.signal_fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
         try watcher.addFd(watcher.signal_fd.?, .signal);
@@ -552,6 +625,7 @@ const LinuxWatcher = struct {
     fn deinit(self: *LinuxWatcher) void {
         if (self.inotify_fd) |fd| posix.close(fd);
         if (self.signal_fd) |fd| posix.close(fd);
+        if (self.watched_fd) |fd| posix.close(fd);
         if (self.child_fd) |fd| posix.close(fd);
         if (self.parent_fd) |fd| posix.close(fd);
         posix.close(self.epfd);
@@ -574,6 +648,7 @@ const LinuxWatcher = struct {
         return switch (event_id) {
             .parent => .parent_exited,
             .child => .child_exited,
+            .watched => .watched_pid_exited,
             .signal => blk: {
                 self.drainSignalFd();
                 break :blk .{ .signal = 0 };
@@ -641,7 +716,7 @@ const LinuxWatcher = struct {
 };
 
 const UnsupportedWatcher = struct {
-    fn init(_: posix.pid_t, _: posix.pid_t, _: ?[]const u8) !UnsupportedWatcher {
+    fn init(_: posix.pid_t, _: posix.pid_t, _: ?[]const u8, _: ?posix.pid_t) !UnsupportedWatcher {
         return error.UnsupportedPlatform;
     }
 
@@ -663,7 +738,31 @@ test "parse accepts command after separator" {
     try std.testing.expectEqualStrings("sh", parsed.command[0]);
 }
 
+test "parse accepts watch pid" {
+    const args = &.{ "--watch-pid", "4321", "--", "sh", "-c", "true" };
+    const parsed = try parseArgs(args);
+    try std.testing.expectEqual(@as(posix.pid_t, 4321), parsed.watch_pid.?);
+    try std.testing.expectEqualStrings("sh", parsed.command[0]);
+}
+
+test "parse rejects invalid watch pid" {
+    try std.testing.expectError(error.InvalidNumber, parseArgs(&.{ "--watch-pid", "not-a-pid", "--", "true" }));
+    try std.testing.expectError(error.InvalidNumber, parseArgs(&.{ "--watch-pid", "-1", "--", "true" }));
+    try std.testing.expectError(error.InvalidNumber, parseArgs(&.{ "--watch-pid", "0", "--", "true" }));
+}
+
 test "parse rejects missing command" {
     try std.testing.expectError(error.MissingCommand, parseArgs(&.{}));
     try std.testing.expectError(error.MissingCommand, parseArgs(&.{"--"}));
+}
+
+test "versionLine renders version and git sha" {
+    var buf: [256]u8 = undefined;
+    const line = try versionLine(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, line, "janitor "));
+    // The configured version and sha are both interpolated, wrapped in parens.
+    try std.testing.expect(std.mem.indexOf(u8, line, version) != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, git_sha) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '(') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, ')') != null);
 }

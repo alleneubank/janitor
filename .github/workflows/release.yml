@@ -45,8 +45,11 @@ jobs:
           set -eu
           version="${RELEASE_TAG#v}"
           archive_base="janitor-${version}-${ARTIFACT_TARGET}"
+          # Computed with the runner's git (the nix dev shell ships no git) so
+          # the embedded `janitor --version` sha is always real, never "unknown".
+          git_sha="$(git rev-parse --short HEAD)"
 
-          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
+          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET" -Dgit_sha="$git_sha"
 
           mkdir -p "dist/$archive_base"
           cp zig-out/bin/janitor "dist/$archive_base/janitor"
@@ -135,7 +138,10 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --keychain "$keychain_path"
 
-          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
+          # Computed with the runner's git (the nix dev shell ships no git) so
+          # the embedded `janitor --version` sha is always real, never "unknown".
+          git_sha="$(git rev-parse --short HEAD)"
+          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET" -Dgit_sha="$git_sha"
           codesign --force --timestamp --options runtime \
             --sign "$CODESIGN_IDENTITY" \
             zig-out/bin/janitor

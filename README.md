@@ -53,8 +53,13 @@ JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 ## Usage
 
 ```sh
-janitor [--watch-path PATH] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+janitor version | --version | -V
 ```
+
+`janitor version` (or `--version` / `-V`) prints `janitor <version> (<sha>)`,
+where `<sha>` is the short git commit the binary was built from (`unknown` when
+built outside a git checkout), so a deployed binary can be matched to its source.
 
 Examples:
 
@@ -67,6 +72,11 @@ janitor --grace-ms 500 -- tilt up
 `--watch-path` is useful for worktree-based development. If the worktree is
 deleted or moved, `janitor` treats that as a teardown trigger.
 
+`--watch-pid` watches an arbitrary process by PID. When that process exits,
+`janitor` treats it as a teardown trigger. This is useful when the supervised
+command is reparented away from `janitor`, so watching the owning process
+directly is more reliable than relying on `janitor`'s immediate parent.
+
 `--poll-ms` is accepted for compatibility with earlier development builds. On
 supported platforms, the active watcher is event-driven and does not use
 periodic idle polling.
@@ -75,10 +85,29 @@ periodic idle polling.
 
 - macOS and BSD use `kqueue` for process, signal, vnode, and timeout waits.
 - Linux uses `epoll` over `pidfd`, `signalfd`, and `inotify`.
+- Process watches, including the original parent, child, and any `--watch-pid`
+  target, use `EVFILT_PROC` / `NOTE_EXIT` on macOS/BSD and `pidfd` on Linux.
 - Windows is not supported.
 
 The child command is started in a new process group. Teardown only signals that
 group, so unrelated processes are not touched.
+
+## Claude Code plugin
+
+The bundled Claude Code plugin wraps the `Bash` tool so processes a session
+starts are drained by `janitor` when the session ends, including crashes,
+`/clear`, and closed terminals.
+
+It registers a `PreToolUse(Bash)` hook (`janitor cc-hook pretooluse`) that
+rewrites commands to run under `janitor`, tied to the session by a per-session
+lock (`--watch-path`) and the Claude session PID (`--watch-pid`). A `SessionEnd`
+hook drops the lock on clean exits.
+
+The hook fails open: if `janitor` is missing, unsupported, or errors, commands
+run unmodified. The plugin supports macOS and Linux only.
+
+See `plugin/` and `plugin/README.md` for install details and the `JANITOR_CC_*`
+configuration knobs.
 
 ## Limitations
 

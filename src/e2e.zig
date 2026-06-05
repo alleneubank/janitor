@@ -32,11 +32,44 @@ pub fn main() !void {
     }
 
     const janitor_exe = args[1];
+    try testVersionCommand(allocator, janitor_exe);
     try testNormalExit(allocator, janitor_exe);
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
+    try testWatchPidKillsProcessGroup(allocator, janitor_exe);
     try testSignalKillsProcessGroup(allocator, janitor_exe);
     try testParentDeathKillsProcessGroup(allocator, janitor_exe);
     try testInteractiveForegroundHandoff(allocator, janitor_exe);
+}
+
+// REQ-JANITOR-015: `janitor --version`, `-V`, and the `version` subcommand each
+// print the package version plus build-time git sha to stdout and exit 0, so a
+// deployed binary can be matched back to its source. Exercises the compiled
+// binary (not the library) per the project's e2e convention.
+fn testVersionCommand(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    const forms = [_][]const u8{ "--version", "-V", "version" };
+    for (forms) |form| {
+        const result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ janitor_exe, form },
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        try expectExited(result.term, 0, "version request exits 0");
+
+        // Assert the banner shape ("janitor <version> (<sha>)") without pinning
+        // the exact version/sha, which change per release and per build.
+        if (!std.mem.startsWith(u8, result.stdout, "janitor ")) {
+            std.debug.print("version form {s}: missing banner prefix: {s}\n", .{ form, result.stdout });
+            return error.VersionBannerMissing;
+        }
+        if (std.mem.indexOfScalar(u8, result.stdout, '(') == null or
+            std.mem.indexOfScalar(u8, result.stdout, ')') == null)
+        {
+            std.debug.print("version form {s}: missing sha parens: {s}\n", .{ form, result.stdout });
+            return error.VersionShaMissing;
+        }
+    }
 }
 
 // REQ-JANITOR-013: with a controlling terminal, janitor must hand terminal
@@ -220,6 +253,66 @@ fn testWatchPathKillsProcessGroup(allocator: std.mem.Allocator, janitor_exe: []c
 
     const term = try child.wait();
     try expectExitedAny(term, "watch-path teardown exits instead of hanging");
+    try waitForProcessGone(stubborn_pid, 3000);
+}
+
+fn testWatchPidKillsProcessGroup(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    var sandbox = try Sandbox.init(allocator, "watch-pid");
+    defer sandbox.deinit();
+
+    const child_pid_path = try sandbox.path("child.pid");
+    const stubborn_script = try sandbox.writeScript("stubborn.sh",
+        \\trap "" TERM
+        \\while :; do sleep 1; done
+        \\
+    );
+    const runner_script = try Sandbox.writeScriptFmt(
+        \\sh "{s}" &
+        \\echo $! > "{s}"
+        \\wait
+        \\
+    , sandbox, "runner.sh", .{ stubborn_script, child_pid_path });
+
+    var doomed = std.process.Child.init(&.{ "sleep", "30" }, allocator);
+    doomed.stdin_behavior = .Ignore;
+    doomed.stdout_behavior = .Ignore;
+    doomed.stderr_behavior = .Inherit;
+    try doomed.spawn();
+
+    var doomed_reaped = false;
+    defer {
+        if (!doomed_reaped) {
+            posix.kill(doomed.id, posix.SIG.KILL) catch {};
+            _ = doomed.wait() catch {};
+        }
+    }
+
+    const doomed_pid_arg = try std.fmt.allocPrint(allocator, "{d}", .{doomed.id});
+    defer allocator.free(doomed_pid_arg);
+
+    var child = std.process.Child.init(&.{
+        janitor_exe,
+        "--watch-pid",
+        doomed_pid_arg,
+        "--grace-ms",
+        "150",
+        "--poll-ms",
+        "20",
+        "--",
+        "sh",
+        runner_script,
+    }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    const stubborn_pid = try waitForPidFile(child_pid_path, 2000);
+    try posix.kill(doomed.id, posix.SIG.TERM);
+
+    try expectExitedAny(try child.wait(), "watch-pid teardown exits instead of hanging");
+    _ = try doomed.wait();
+    doomed_reaped = true;
     try waitForProcessGone(stubborn_pid, 3000);
 }
 
