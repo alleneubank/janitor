@@ -86,6 +86,25 @@
               platforms = builtins.attrNames ziglintSources;
             };
           };
+        # nixpkgs still ships lefthook <= 2.1.5 (2.1.9 bump pending in
+        # NixOS/nixpkgs#514847). Hooks need >= 2.1.6 for the pty/setsid fix
+        # (evilmartians/lefthook#1392): older versions allocate a pty via
+        # setsid() for every `run:` command, which sandboxed environments such
+        # as Claude Code sessions forbid, failing all hooks with EPERM.
+        # 2.1.8 (not 2.1.9) because 2.1.9's go.mod needs Go >= 1.26.3 while
+        # the pinned nixpkgs has 1.26.1; 2.1.8 also silences the spurious
+        # core.hooksPath warning (lefthook#1421). Drop this override once the
+        # nixpkgs bump lands.
+        lefthook = pkgs.lefthook.overrideAttrs (finalAttrs: prevAttrs: {
+          version = "2.1.8";
+          src = pkgs.fetchFromGitHub {
+            owner = "evilmartians";
+            repo = "lefthook";
+            rev = "v${finalAttrs.version}";
+            hash = "sha256-ZCdDRJw59M/Uy0/z2fsNc/KRQx0ZXANOe1UFJZE7ffQ=";
+          };
+          vendorHash = "sha256-jVjdGnNRRFTjd2/DjKHZmLWkbtb3eEQ+R/yw1LBa3bE=";
+        });
       in {
         formatter = pkgs.alejandra;
 
@@ -96,7 +115,7 @@
           nativeBuildInputs = [
             pkgs.zigpkgs."0.15.2"
             pkgs.zls
-            pkgs.lefthook
+            lefthook
             pkgs.jq
             pkgs.ripgrep
             ziglint
