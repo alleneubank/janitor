@@ -66,6 +66,26 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(cc_hook_tests).step);
 
+    // Keep plugin distribution checks explicit so ordinary builds still work
+    // from a checkout with a temporarily edited manifest.
+    const check_plugin_version_exe = b.addExecutable(.{
+        .name = "check-plugin-version",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/check_plugin_version.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const check_plugin_version_run = b.addRunArtifact(check_plugin_version_exe);
+    check_plugin_version_run.addArg(zon.version);
+    check_plugin_version_run.addFileArg(b.path("plugin/.claude-plugin/plugin.json"));
+
+    const check_plugin_version_step = b.step(
+        "check-plugin-version",
+        "Check plugin manifest version matches build.zig.zon",
+    );
+    check_plugin_version_step.dependOn(&check_plugin_version_run.step);
+
     const e2e_exe = b.addExecutable(.{
         .name = "janitor-e2e",
         .root_module = b.createModule(.{

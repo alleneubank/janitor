@@ -76,6 +76,10 @@ group, watches for owner-death signals, and drains that group with
   commit (`janitor <version> (<sha>)`) to standard output and exit 0. The
   version is single-sourced from `build.zig.zon`; the commit degrades to
   `unknown` when built outside a git checkout.
+- **REQ-JANITOR-016**: The Claude Code plugin manifest version in
+  `plugin/.claude-plugin/plugin.json` equals the package version in
+  `build.zig.zon`; `zig build check-plugin-version` enforces the two versions
+  stay in sync.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, signs the binary with a Developer ID Application
   certificate, packages README and LICENSE beside the binary, and submits the
@@ -196,6 +200,8 @@ group, watches for owner-death signals, and drains that group with
   `testWatchPidKillsProcessGroup`.
 - REQ-JANITOR-015: `src/root.zig` `versionLine` test, `src/e2e.zig`
   `testVersionCommand`.
+- REQ-JANITOR-016: `src/check_plugin_version.zig` and `zig build
+  check-plugin-version`.
 - REQ-JANITOR-009: `src/e2e.zig` `testNormalExit`.
 - REQ-JANITOR-010, REQ-JANITOR-011, REQ-JANITOR-012: `src/root.zig` watcher
   backend selection, plus native and cross-target builds.

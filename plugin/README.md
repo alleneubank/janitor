@@ -38,8 +38,12 @@ unchanged; `janitor` is transparent.
 
    (Default install location is `~/.local/bin/janitor`.)
 
-2. Install this plugin — via the Claude Code plugin marketplace, or by pointing
-   Claude Code at the `plugin/` directory locally.
+2. Install this plugin from the Claude Code plugin marketplace:
+
+   ```sh
+   /plugin marketplace add alleneubank/janitor
+   /plugin install janitor-bash-drain@janitor
+   ```
 
 The hooks **fail open**: if `janitor` is not installed or not on `PATH`, the
 hook is a no-op and your command runs unmodified. Nothing this plugin does can

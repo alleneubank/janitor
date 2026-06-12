@@ -106,6 +106,13 @@ hook drops the lock on clean exits.
 The hook fails open: if `janitor` is missing, unsupported, or errors, commands
 run unmodified. The plugin supports macOS and Linux only.
 
+Install from the Claude Code plugin marketplace:
+
+```sh
+/plugin marketplace add alleneubank/janitor
+/plugin install janitor-bash-drain@janitor
+```
+
 See `plugin/` and `plugin/README.md` for install details and the `JANITOR_CC_*`
 configuration knobs.
 
@@ -170,3 +177,7 @@ Version tags create a draft GitHub Release with prebuilt Linux and macOS
 archives plus checksum files. The macOS archives are signed and notarized in
 GitHub Actions when the required Apple signing secrets are present. Homebrew can
 come later once archive URLs and checksums are stable.
+
+Release bumps must update `plugin/.claude-plugin/plugin.json` to match
+`build.zig.zon`; `zig build check-plugin-version` enforces the two versions
+stay in sync.

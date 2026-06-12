@@ -18,5 +18,7 @@ pre-push:
       run: zig build fmt
     lint:
       run: ziglint
+    plugin-version:
+      run: zig build check-plugin-version
     test:
       run: zig build test

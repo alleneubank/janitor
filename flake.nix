@@ -105,6 +105,9 @@
           shellHook =
             ''
               echo "zig $(zig version)"
+              if [ -e .git ]; then
+                lefthook install >/dev/null 2>&1 || true
+              fi
             ''
             + (pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               unset SDKROOT

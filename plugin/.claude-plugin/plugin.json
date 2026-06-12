@@ -1,6 +1,6 @@
 {
   "name": "janitor-bash-drain",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Wrap the Bash tool with janitor so processes a Claude Code session starts are drained when the session ends.",
   "author": { "name": "Allen Eubank" },
   "homepage": "https://github.com/alleneubank/janitor"
