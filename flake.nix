@@ -124,8 +124,15 @@
           shellHook =
             ''
               echo "zig $(zig version)"
+              # Idempotent and quiet when healthy, but surface failures:
+              # swallowing them leaves the repo with no git hooks and no
+              # hint why (e.g. a stray core.hooksPath once blocked install).
               if [ -e .git ]; then
-                lefthook install >/dev/null 2>&1 || true
+                if ! lefthook_install_out="$(lefthook install 2>&1)"; then
+                  echo "warning: lefthook install failed; git hooks are not active:" >&2
+                  echo "$lefthook_install_out" >&2
+                fi
+                unset lefthook_install_out
               fi
             ''
             + (pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
