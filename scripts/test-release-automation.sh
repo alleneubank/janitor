@@ -30,14 +30,21 @@ assert_contains "$dry_run" "codesign --force --sign -"
 assert_contains "$dry_run" "ditto -c -k --keepParent"
 assert_contains "$dry_run" "ditto -x -k"
 assert_contains "$dry_run" "codesign --verify --strict"
+assert_contains "$dry_run" "export SDKROOT=\$(xcrun --sdk macosx --show-sdk-path)"
 
 if RELEASE_TAG=v0.0.0 "$release_script" --dry-run --target aarch64-macos >/dev/null 2>&1; then
   fail "mismatched release tag unexpectedly passed"
 fi
 
 workflow_text="$(sed -n '1,260p' "$workflow")"
-assert_contains "$workflow_text" "nix develop -c scripts/release-macos.sh"
+assert_contains "$workflow_text" "mlugg/setup-zig@v2.2.1"
+assert_contains "$workflow_text" "scripts/release-macos.sh"
 assert_contains "$workflow_text" "if-no-files-found: error"
 assert_contains "$workflow_text" "--draft"
+
+ci_workflow_text="$(sed -n '1,220p' "$project_root/.github/workflows/ci.yml")"
+assert_contains "$ci_workflow_text" "runs-on: macos-14"
+assert_contains "$ci_workflow_text" "mlugg/setup-zig@v2.2.1"
+assert_contains "$ci_workflow_text" "scripts/release-macos.sh"
 
 echo "release automation contract: ok"

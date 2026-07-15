@@ -135,10 +135,22 @@ trap cleanup EXIT HUP INT TERM
 if [ "$dry_run" -eq 0 ]; then
   [ "$(uname -s)" = "Darwin" ] || die "macOS release packaging must run on macOS"
   need zig
+  need xcrun
   need codesign
   need ditto
   need cmp
   need shasum
+fi
+
+# Nix shells intentionally avoid inheriting a host SDKROOT. Resolve the active
+# Apple SDK explicitly so Zig can link its generated build executable on clean
+# GitHub-hosted runners as well as maintainer machines.
+if [ "$dry_run" -eq 1 ]; then
+  echo "+ export SDKROOT=\$(xcrun --sdk macosx --show-sdk-path)"
+else
+  SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+  [ -d "$SDKROOT" ] || die "xcrun returned a missing macOS SDK: $SDKROOT"
+  export SDKROOT
 fi
 
 # A release-provided sha wins so CI does not depend on git inside the Nix shell.

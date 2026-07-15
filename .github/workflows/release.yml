@@ -31,7 +31,9 @@ jobs:
             artifact: linux-aarch64
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.15.2
 
       - name: Build archive
         env:
@@ -68,7 +70,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.artifact }}
-    runs-on: macos-latest
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
@@ -91,7 +93,7 @@ jobs:
           # the embedded `janitor --version` sha is always real, never "unknown".
           RELEASE_GIT_SHA="$(git rev-parse --short HEAD)"
           export RELEASE_GIT_SHA
-          nix develop -c scripts/release-macos.sh \
+          scripts/release-macos.sh \
             --target "$ZIG_TARGET" \
             --dist-dir dist
 
