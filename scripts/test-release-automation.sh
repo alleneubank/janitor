@@ -41,6 +41,12 @@ assert_contains "$workflow_text" "mlugg/setup-zig@v2.2.1"
 assert_contains "$workflow_text" "scripts/release-macos.sh"
 assert_contains "$workflow_text" "if-no-files-found: error"
 assert_contains "$workflow_text" "--draft"
+if grep -F "nix develop" "$workflow" >/dev/null; then
+  fail "release workflow unexpectedly depends on a Nix development shell"
+fi
+if [ "$(grep -c 'mlugg/setup-zig@v2.2.1' "$workflow")" -ne 2 ]; then
+  fail "both Linux and macOS release jobs must use pinned standalone Zig"
+fi
 
 ci_workflow_text="$(sed -n '1,220p' "$project_root/.github/workflows/ci.yml")"
 assert_contains "$ci_workflow_text" "runs-on: macos-14"
