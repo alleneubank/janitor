@@ -48,11 +48,11 @@ jobs:
             exit 1
           }
           archive_base="janitor-${version}-${ARTIFACT_TARGET}"
-          # Computed with the runner's git (the nix dev shell ships no git) so
+          # Computed with the runner's git so
           # the embedded `janitor --version` sha is always real, never "unknown".
           git_sha="$(git rev-parse --short HEAD)"
 
-          nix develop -c zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET" -Dgit_sha="$git_sha"
+          zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET" -Dgit_sha="$git_sha"
 
           mkdir -p "dist/$archive_base"
           cp zig-out/bin/janitor "dist/$archive_base/janitor"
@@ -81,7 +81,9 @@ jobs:
             artifact: macos-x86_64
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.15.2
 
       - name: Build and verify archive
         env:
@@ -89,7 +91,7 @@ jobs:
           ZIG_TARGET: ${{ matrix.zig-target }}
         run: |
           set -eu
-          # Computed with the runner's git (the nix dev shell ships no git) so
+          # Computed with the runner's git so
           # the embedded `janitor --version` sha is always real, never "unknown".
           RELEASE_GIT_SHA="$(git rev-parse --short HEAD)"
           export RELEASE_GIT_SHA
