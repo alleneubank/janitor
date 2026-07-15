@@ -60,12 +60,14 @@ jobs:
           - x86_64-macos
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.15.2
       - name: Build and verify archive
         env:
           RELEASE_GIT_SHA: ${{ github.sha }}
         run: |
-          nix develop -c scripts/release-macos.sh \
+          scripts/release-macos.sh \
             --target "${{ matrix.target }}" \
             --dist-dir dist
 
