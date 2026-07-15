@@ -43,7 +43,7 @@ assert_contains "$workflow_text" "if-no-files-found: error"
 assert_contains "$workflow_text" "--draft"
 
 ci_workflow_text="$(sed -n '1,220p' "$project_root/.github/workflows/ci.yml")"
-assert_contains "$ci_workflow_text" "runs-on: macos-latest"
+assert_contains "$ci_workflow_text" "runs-on: macos-14"
 assert_contains "$ci_workflow_text" "mlugg/setup-zig@v2.2.1"
 assert_contains "$ci_workflow_text" "scripts/release-macos.sh"
 

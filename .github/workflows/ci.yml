@@ -51,7 +51,7 @@ jobs:
       - run: sh scripts/test-release-automation.sh
 
   release-macos:
-    runs-on: macos-latest
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
