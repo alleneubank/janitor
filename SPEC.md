@@ -23,9 +23,12 @@ group, watches for owner-death signals, and drains that group with
 - **Grace window**: bounded delay after `SIGTERM` before `SIGKILL`.
 - **Release artifact**: a versioned archive containing the `janitor` binary,
   README, LICENSE, and checksum material for GitHub Releases.
-- **Notary profile**: a local keychain profile created by `notarytool
-  store-credentials`; it is referenced by name and keeps Apple credentials out
-  of scripts, logs, and command arguments.
+- **Ad-hoc signature**: a credential-free Mach-O code signature that detects
+  post-signing byte changes without asserting an Apple-verified developer
+  identity.
+- **Package-manager distribution**: installation through a hash-verifying CLI
+  such as Nix or mise, which does not model browser-downloaded, quarantined app
+  distribution.
 - **Stable release**: the latest non-draft, non-prerelease GitHub Release
   selected by GitHub's `releases/latest` endpoint.
 - **Build metadata**: the package version (from `build.zig.zon`) and the short
@@ -81,22 +84,24 @@ group, watches for owner-death signals, and drains that group with
   `build.zig.zon`; `zig build check-plugin-version` enforces the two versions
   stay in sync.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
-  builds `ReleaseSafe`, signs the binary with a Developer ID Application
-  certificate, packages README and LICENSE beside the binary, and submits the
-  archive to Apple's notary service.
-- **REQ-RELEASE-002**: Release automation must not accept Apple passwords,
-  app-specific passwords, private keys, or certificate passwords as command-line
-  arguments; notarization uses a named keychain profile.
-- **REQ-RELEASE-003**: The macOS release script supports a dry-run mode and
-  explicit skip flags for signing and notarization so maintainers can validate
-  packaging logic without credentials.
+  builds `ReleaseSafe`, applies a credential-free ad-hoc signature, packages
+  README and LICENSE beside the binary, extracts the archive, and verifies the
+  extracted binary with strict code-signature validation.
+- **REQ-RELEASE-002**: Release automation requires no Apple signing identity,
+  certificate, password, private key, notarization credential, or other secret.
+- **REQ-RELEASE-003**: The macOS release script supports a dry-run mode so
+  maintainers can validate the exact build, signing, packaging, extraction, and
+  verification commands without credentials or filesystem mutation.
 - **REQ-RELEASE-004**: Release archive names include the package version and
   target platform, and each archive has a SHA-256 checksum file.
 - **REQ-RELEASE-005**: GitHub Actions creates draft GitHub Releases for version
   tags with prebuilt archives for common Linux and macOS targets.
-- **REQ-RELEASE-006**: GitHub Actions signs macOS release binaries with a
-  Developer ID Application certificate and submits the archives to Apple's
-  notary service before attaching them to the draft release.
+- **REQ-RELEASE-006**: GitHub Actions delegates macOS packaging to the local
+  release script, and only attaches archives whose extracted binaries pass
+  strict ad-hoc signature verification.
+- **REQ-RELEASE-007**: Release artifacts are built for hash-verifying CLI and
+  package-manager installation. Browser/Finder distribution of quarantined
+  archives is outside the supported release contract.
 - **REQ-INSTALL-001**: `install.sh` defaults to the latest stable GitHub Release
   and selects the archive matching the host operating system and CPU
   architecture.
@@ -134,9 +139,10 @@ group, watches for owner-death signals, and drains that group with
   drained.
 - Parent death is detected as `getppid() != original_parent`, not
   `getppid() == 1`.
-- Release automation never prints secret values; local secret material stays in
-  the macOS keychain, and CI secret material stays in GitHub Secrets plus
-  temporary runner keychains.
+- Release automation has no signing or notarization secrets to read, print, or
+  persist.
+- The macOS binary verified after archive extraction is byte-identical to the
+  binary packaged in that archive.
 - A GitHub Release remains draft until a maintainer reviews the generated
   artifacts.
 
@@ -151,8 +157,8 @@ group, watches for owner-death signals, and drains that group with
   wait mechanism on supported event backends.
 - No attempt to recover children that deliberately call `setsid()` without their
   own nested janitor.
-- No signed macOS `.pkg` artifact until a Developer ID Installer certificate is
-  available.
+- No Developer ID identity, Apple notarization, Gatekeeper approval, signed
+  macOS `.pkg`, or browser/Finder distribution contract.
 - No Windows binary release until the implementation supports Windows process
   supervision semantics.
 
@@ -175,13 +181,14 @@ group, watches for owner-death signals, and drains that group with
       foreground process group is restored after teardown.
 - [ ] Non-terminal standard input leaves terminal foreground state untouched
       (the `sh`-based teardown e2e tests keep passing unchanged).
-- [x] Local macOS release automation has a syntax check and dry-run path.
-- [x] Draft GitHub Release automation builds ReleaseSafe archives for common
+- [x] Local macOS release automation has a syntax check and dry-run path that
+      proves credential-free ad-hoc signing and archive-roundtrip verification.
+- [ ] Draft GitHub Release automation builds ReleaseSafe archives for common
       Linux and macOS targets with SHA-256 checksums.
 - [x] `install.sh` defaults to the latest stable GitHub Release asset, verifies
       checksums, and installs the selected binary.
-- [x] Release documentation describes keychain-profile notarization without
-      asking maintainers to pass passwords on the command line.
+- [x] Release documentation describes the package-manager distribution boundary
+      and credential-free ad-hoc signature verification.
 - [x] `janitor cc-hook pretooluse` rewrites a Bash command under `janitor` and
       fails open on malformed input.
 - [x] The Claude Code plugin manifest and hooks JSON are valid and register the
@@ -208,8 +215,9 @@ group, watches for owner-death signals, and drains that group with
 - REQ-JANITOR-013: `src/e2e.zig` `testInteractiveForegroundHandoff`.
 - REQ-RELEASE-001, REQ-RELEASE-002, REQ-RELEASE-003, REQ-RELEASE-004:
   `scripts/release-macos.sh`, `sh -n scripts/release-macos.sh`, and
-  `scripts/release-macos.sh --dry-run --skip-sign --skip-notarize`.
-- REQ-RELEASE-005, REQ-RELEASE-006: `.github/workflows/release.yml`.
+  `scripts/release-macos.sh --dry-run --target aarch64-macos`.
+- REQ-RELEASE-005, REQ-RELEASE-006, REQ-RELEASE-007:
+  `scripts/test-release-automation.sh` and `.github/workflows/release.yml`.
 - REQ-INSTALL-001, REQ-INSTALL-002, REQ-INSTALL-003: `install.sh`, `sh -n
   install.sh`, `JANITOR_INSTALL_DRY_RUN=1 ./install.sh`, and
   `JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh`.

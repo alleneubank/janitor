@@ -146,37 +146,28 @@ zig build -Dtarget=x86_64-linux
 
 ## Release Notes For Maintainers
 
-For macOS distribution outside the App Store, release binaries are signed with a
-Developer ID Application certificate and submitted to Apple's notary service.
-This repository intentionally keeps signing credentials in GitHub Secrets or the
-local macOS keychain, never in tracked files.
+Janitor's release archives target hash-verifying CLI installers and package
+managers such as the bundled installer, mise, and Nix. macOS binaries carry a
+credential-free ad-hoc signature: it proves the binary did not change after
+signing, but it does not assert an Apple-verified developer identity. Browser or
+Finder distribution of quarantined downloads is not part of this release
+contract.
 
-Create a local notarytool keychain profile once. Enter the app-specific password
-only through Apple's secure prompt; do not pass it as a command argument:
-
-```sh
-xcrun notarytool store-credentials janitor-notary \
-  --apple-id "YOUR_APPLE_ID_EMAIL" \
-  --team-id H93YRR23HH
-```
-
-Build a signed and notarized macOS archive locally:
+Build and verify a macOS archive locally:
 
 ```sh
 scripts/release-macos.sh
 ```
 
-Use `scripts/release-macos.sh --dry-run --skip-sign --skip-notarize` to inspect
-the release commands without requiring signing credentials.
-
-The script checks `codesign` locally and waits for Apple notarization to return
-`Accepted`. Raw CLI zip archives are not stapled like app bundles or packages,
-so Gatekeeper checks the notarization ticket online after download.
+Use `scripts/release-macos.sh --dry-run --target aarch64-macos` to inspect the
+build, ad-hoc signing, packaging, extraction, and strict verification commands.
+No Apple certificate, keychain profile, password, private key, or notarization
+credential is required.
 
 Version tags create a draft GitHub Release with prebuilt Linux and macOS
-archives plus checksum files. The macOS archives are signed and notarized in
-GitHub Actions when the required Apple signing secrets are present. Homebrew can
-come later once archive URLs and checksums are stable.
+archives plus checksum files. GitHub Actions uses the same local release script
+for macOS and attaches an archive only after its extracted binary passes
+`codesign --verify --strict`.
 
 Release bumps must update `plugin/.claude-plugin/plugin.json` to match
 `build.zig.zon`; `zig build check-plugin-version` enforces the two versions
