@@ -50,6 +50,25 @@ jobs:
       - run: sh -n scripts/release-macos.sh scripts/test-release-automation.sh
       - run: sh scripts/test-release-automation.sh
 
+  release-macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-macos
+          - x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Build and verify archive
+        env:
+          RELEASE_GIT_SHA: ${{ github.sha }}
+        run: |
+          nix develop -c scripts/release-macos.sh \
+            --target "${{ matrix.target }}" \
+            --dist-dir dist
+
   docs:
     runs-on: ubuntu-latest
     steps:
