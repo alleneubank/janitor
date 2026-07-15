@@ -43,6 +43,13 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix develop -c zig build check-plugin-version
 
+  release-automation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n scripts/release-macos.sh scripts/test-release-automation.sh
+      - run: sh scripts/test-release-automation.sh
+
   docs:
     runs-on: ubuntu-latest
     steps:
