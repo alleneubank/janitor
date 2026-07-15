@@ -51,7 +51,7 @@ closed on missing files, hash drift, invalid signatures, or build failures.
   installation; quarantined browser/Finder downloads are outside the contract.
 - Invalid published artifacts are superseded with a new patch release; existing
   tags and assets are never replaced in place.
-- `0xBigBoss/janitor-overlay` is the reusable prebuilt-binary Nix source.
+- `alleneubank/janitor-overlay` is the reusable prebuilt-binary Nix source.
 - Consumers invoke the overlay package by its absolute Nix store path; dev-shell
   PATH exposure is not the integration mechanism.
 - Artifact integrity comes from immutable versioned URLs, committed SHA-256
