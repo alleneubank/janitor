@@ -434,7 +434,7 @@ fn captureLinuxOne(pid: posix.pid_t) ?ProcessIdentity {
     const path = std.fmt.bufPrint(&name, "/proc/{d}", .{pid}) catch return null;
     var dir = std.fs.openDirAbsolute(path, .{}) catch return null;
     defer dir.close();
-    const item = readLinuxStat(dir) orelse return null;
+    const item = (readLinuxStat(dir) catch return null) orelse return null;
     if (item.identity.pid != pid) return null;
     return item.identity;
 }
@@ -543,7 +543,12 @@ fn linuxAcquisitionDispositionFromError(
     err: anyerror,
 ) LinuxAcquireError!LinuxAcquisitionDisposition {
     return switch (err) {
-        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.NotDir => .incomplete,
+        error.FileNotFound,
+        error.ProcessNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NotDir,
+        => .incomplete,
         error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
         error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
         error.SystemResources => error.SystemResources,
@@ -862,6 +867,10 @@ test "linux handle reader rejects a recycled proc entry and accepts an exact han
 }
 
 test "linux acquisition maps races separately from fatal handle failures" {
+    try std.testing.expectEqual(
+        LinuxAcquisitionDisposition.incomplete,
+        try linuxAcquisitionDispositionFromError(error.ProcessNotFound),
+    );
     try std.testing.expectEqual(
         LinuxAcquisitionDisposition.incomplete,
         try linuxAcquisitionDispositionFromErrno(.SRCH),
