@@ -135,6 +135,11 @@ the original child process group.
   unbound numeric `/proc/<pid>/stat` snapshot does not satisfy this requirement.
   A record is rejected and diagnosed when the process exits or its PID is
   recycled between numeric enumeration and stable-handle acquisition. On
+  every platform that supports descendant discovery, a child-to-parent edge is
+  accepted only when the parent's identity was captured before the child's
+  final PPID read and is unchanged when revalidated after that read; a numeric
+  PPID without this binding is incomplete and cannot authorize a signal.
+  On
   macOS, Janitor captures start time and immediately re-reads
   `(pid, start_time)` before `kill(pid, signal)`, skipping and diagnosing a
   mismatch. macOS cannot atomically eliminate the validation-to-`kill`
@@ -143,7 +148,9 @@ the original child process group.
   teardown and do not advertise descendant draining.
 - **REQ-JANITOR-022**: Before forced teardown, Janitor performs a bounded
   resweep to narrow the snapshot-to-signal spawn race. A resweep may add only a
-  process whose ancestry is proven from a still-matching captured identity.
+  process whose ancestry is proven from a still-matching captured identity and
+  whose new child-to-parent edge carries the same before/after parent-identity
+  binding as the initial snapshot.
 - **REQ-JANITOR-023**: Incomplete discovery emits a clear diagnostic and still
   drains the original child process group. It never blocks that cleanup or
   broadens the guessed individual signal set.
@@ -354,7 +361,8 @@ the original child process group.
   `testWatchPathDetachedDescendant` opt-out coverage.
 - REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023:
   `src/process_tree.zig` identity-validation, PID-reuse, bounded-resweep,
-  incomplete-discovery, and unrelated-process-exclusion unit coverage; plus
+  incomplete-discovery, unrelated-process-exclusion, and `parent identity
+  binding rejects recycled parent slots` table-driven unit coverage; plus
   `src/root.zig` `discovery plan executes original-group cleanup and reports
   limitations`, which executes the production plan with a recorder and captures
   incomplete/capture-failure diagnostics, and `stale descendant identity from

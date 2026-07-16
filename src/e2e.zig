@@ -819,22 +819,6 @@ fn processExists(pid: posix.pid_t) bool {
     return true;
 }
 
-fn killAndWaitForProcessGone(pid: posix.pid_t) void {
-    // The red harness intentionally exposes a survivor. Always force it down
-    // after the assertion (or any earlier failure) and wait a bounded time so
-    // the sandbox deletion cannot hide a leaked process.
-    posix.kill(pid, posix.SIG.KILL) catch |err| switch (err) {
-        error.ProcessNotFound => return,
-        else => {
-            std.debug.print("failed to SIGKILL detached fixture pid {d}: {s}\n", .{ pid, @errorName(err) });
-            return;
-        },
-    };
-    waitForProcessGone(pid, 3000) catch |err| {
-        std.debug.print("detached fixture pid {d} cleanup wait failed: {s}\n", .{ pid, @errorName(err) });
-    };
-}
-
 // `std.process.Child.wait` is deliberately blocking. The fixture instead
 // polls waitpid with W.NOHANG so a regression in Janitor's teardown cannot
 // stall the entire e2e suite. This raw reap consumes the child status, so the

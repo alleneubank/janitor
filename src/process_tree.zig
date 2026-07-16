@@ -30,6 +30,10 @@ pub const ProcessRecord = struct {
     identity: ProcessIdentity,
     ppid: posix.pid_t,
     pgid: posix.pid_t,
+    /// The exact parent identity observed before this record's final PPID read
+    /// and revalidated afterwards. A numeric PPID alone is never an ancestry
+    /// proof because the parent PID can be recycled between independent reads.
+    parent_identity: ?ProcessIdentity = null,
 
     pub fn isEscaped(self: ProcessRecord, original_pgid: posix.pid_t) bool {
         return self.pgid != original_pgid;
@@ -46,9 +50,9 @@ pub const Discovery = struct {
     }
 };
 
-/// Selects only the PPID-linked closure rooted at an exact identity. A missing
-/// parent or duplicate PID makes the answer incomplete and excludes the branch;
-/// it never turns a numeric PID into ownership evidence.
+/// Selects only the parent-identity-bound closure rooted at an exact identity.
+/// A missing, unbound, or duplicate parent makes the answer incomplete and
+/// excludes the branch; it never turns a numeric PID into ownership evidence.
 pub fn descendantClosure(
     allocator: std.mem.Allocator,
     table: []const ProcessRecord,
@@ -76,9 +80,15 @@ pub fn descendantClosure(
             // Exact duplicates are collapsed by uniqueExactIndexForPid.
             if (uniqueExactIndexForPid(table, candidate.identity.pid, &incomplete) == null) continue;
             if (containsIdentity(selected.items, candidate.identity)) continue;
-
-            // The table is immutable for the pure model, so a PPID link to an
-            // already-selected exact parent is the complete available proof.
+            if (candidate.parent_identity) |bound_parent| {
+                if (!bound_parent.eql(parent.identity)) {
+                    incomplete = true;
+                    continue;
+                }
+            } else {
+                incomplete = true;
+                continue;
+            }
             try selected.append(allocator, candidate);
         }
     }
@@ -123,6 +133,14 @@ pub fn resweepDescendants(
         for (resweep_table) |candidate| {
             if (candidate.ppid != parent.identity.pid) continue;
             if (uniqueExactIndexForPid(resweep_table, candidate.identity.pid, &incomplete) == null) continue;
+            const bound_parent = candidate.parent_identity orelse {
+                incomplete = true;
+                continue;
+            };
+            if (!bound_parent.eql(parent.identity)) {
+                incomplete = true;
+                continue;
+            }
             if (capturedRecordForPid(captured, candidate.identity.pid, &incomplete)) |captured_record| {
                 if (!candidate.identity.eql(captured_record.identity)) {
                     incomplete = true;
@@ -165,7 +183,13 @@ fn uniqueExactIndexForPid(table: []const ProcessRecord, pid: posix.pid_t, incomp
 }
 
 fn recordEql(left: ProcessRecord, right: ProcessRecord) bool {
-    return left.identity.eql(right.identity) and left.ppid == right.ppid and left.pgid == right.pgid;
+    return left.identity.eql(right.identity) and left.ppid == right.ppid and left.pgid == right.pgid and
+        optionalIdentityEql(left.parent_identity, right.parent_identity);
+}
+
+fn optionalIdentityEql(left: ?ProcessIdentity, right: ?ProcessIdentity) bool {
+    if (left) |identity| return if (right) |other| identity.eql(other) else false;
+    return right == null;
 }
 
 fn tableHasAmbiguityOrMissingParent(table: []const ProcessRecord) bool {
@@ -174,6 +198,7 @@ fn tableHasAmbiguityOrMissingParent(table: []const ProcessRecord) bool {
         if (item.ppid > 0 and uniqueExactIndexForPid(table, item.ppid, &incomplete) == null) {
             incomplete = true;
         }
+        if (item.ppid > 0 and item.parent_identity == null) incomplete = true;
         // Check this PID as well, including rows unrelated to the requested
         // root. A partial/ambiguous global table must not be called complete.
         _ = uniqueExactIndexForPid(table, item.identity.pid, &incomplete);
@@ -458,10 +483,33 @@ fn captureLinuxTarget(
     defer if (!transferred) process.close();
 
     var reader: LinuxProcHandleReader = .{ .directory = process };
-    const record = try readLinuxHandleRecord(.{
+    const provisional = try readLinuxHandleRecord(.{
         .pid = pid,
         .entry_identity = entry_identity,
     }, &reader) orelse return .incomplete;
+
+    // The first read is only a parent lead. Keep the parent handle alive,
+    // then take the final child record and revalidate the same parent handle.
+    // This binds the final PPID to a parent which never died in that interval.
+    var record = provisional;
+    if (provisional.ppid > 0) {
+        var parent_name: [32]u8 = undefined;
+        const parent_path = std.fmt.bufPrint(&parent_name, "{d}", .{provisional.ppid}) catch
+            return error.SnapshotSetupFailed;
+        var parent = proc.openDir(parent_path, .{}) catch |err| {
+            _ = try linuxAcquisitionDispositionFromError(err);
+            return .incomplete;
+        };
+        defer parent.close();
+        const parent_before = try readLinuxStat(parent) orelse return .incomplete;
+        if (parent_before.identity.pid != provisional.ppid) return .incomplete;
+
+        record = try reader.readRecord() orelse return .incomplete;
+        if (!record.identity.eql(provisional.identity) or record.ppid != provisional.ppid) return .incomplete;
+        const parent_after = try readLinuxStat(parent) orelse return .incomplete;
+        if (!parent_after.identity.eql(parent_before.identity)) return .incomplete;
+        record.parent_identity = parent_before.identity;
+    }
 
     const target = try allocateTarget(allocator, record, .{ .linux_proc_dir = process.fd });
     transferred = true;
@@ -666,7 +714,7 @@ fn captureDarwin(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocato
     }
     for (pids[0..@min(capacity, actual_count)]) |pid| {
         if (pid <= 0) continue;
-        const item = captureDarwinRecord(pid) orelse {
+        const item = captureDarwinBoundRecord(pid) orelse {
             incomplete = true;
             continue;
         };
@@ -694,6 +742,21 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
     };
 }
 
+/// The preliminary child read supplies only a parent lead. The record returned
+/// to the closure is read after the parent's start-time identity is captured,
+/// and that parent identity is checked once more after the child read.
+fn captureDarwinBoundRecord(pid: posix.pid_t) ?ProcessRecord {
+    const provisional = captureDarwinRecord(pid) orelse return null;
+    if (provisional.ppid <= 0) return provisional;
+    const parent_before = captureDarwinRecord(provisional.ppid) orelse return null;
+    var record = captureDarwinRecord(pid) orelse return null;
+    if (!record.identity.eql(provisional.identity) or record.ppid != provisional.ppid) return null;
+    const parent_after = captureDarwinRecord(provisional.ppid) orelse return null;
+    if (!parent_after.identity.eql(parent_before.identity)) return null;
+    record.parent_identity = parent_before.identity;
+    return record;
+}
+
 fn darwinSignalResult(identity: ProcessIdentity, signal: u8, success: TargetResult) TargetResult {
     const current = captureDarwinOne(identity.pid) orelse return darwinAbsentIdentityResult(identity.pid);
     if (!current.eql(identity)) return .stale;
@@ -719,9 +782,23 @@ fn testRecord(pid: posix.pid_t, start: u128, ppid: posix.pid_t, pgid: posix.pid_
     return .{ .identity = .{ .pid = pid, .start_token = start }, .ppid = ppid, .pgid = pgid };
 }
 
+fn testBoundRecord(
+    pid: posix.pid_t,
+    start: u128,
+    ppid: posix.pid_t,
+    parent_start: u128,
+    pgid: posix.pid_t,
+) ProcessRecord {
+    var record = testRecord(pid, start, ppid, pgid);
+    record.parent_identity = .{ .pid = ppid, .start_token = parent_start };
+    return record;
+}
+
 test "closure selects a happy tree and classifies escaped descendants" {
     const table = [_]ProcessRecord{
-        testRecord(10, 1, 0, 10), testRecord(11, 2, 10, 10), testRecord(12, 3, 11, 99),
+        testRecord(10, 1, 0, 10),
+        testBoundRecord(11, 2, 10, 1, 10),
+        testBoundRecord(12, 3, 11, 2, 99),
     };
     var found = try descendantClosure(std.testing.allocator, &table, table[0].identity);
     defer found.deinit(std.testing.allocator);
@@ -731,13 +808,21 @@ test "closure selects a happy tree and classifies escaped descendants" {
 }
 
 test "closure excludes unrelated rows and marks missing ancestry incomplete" {
-    const unrelated = [_]ProcessRecord{ testRecord(20, 1, 0, 20), testRecord(21, 2, 20, 20), testRecord(99, 3, 0, 99) };
+    const unrelated = [_]ProcessRecord{
+        testRecord(20, 1, 0, 20),
+        testBoundRecord(21, 2, 20, 1, 20),
+        testRecord(99, 3, 0, 99),
+    };
     var selected = try descendantClosure(std.testing.allocator, &unrelated, unrelated[0].identity);
     defer selected.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), selected.records.len);
     try std.testing.expect(!selected.incomplete);
 
-    const missing = [_]ProcessRecord{ testRecord(20, 1, 0, 20), testRecord(21, 2, 20, 20), testRecord(22, 3, 99, 20) };
+    const missing = [_]ProcessRecord{
+        testRecord(20, 1, 0, 20),
+        testBoundRecord(21, 2, 20, 1, 20),
+        testBoundRecord(22, 3, 99, 9, 20),
+    };
     var partial = try descendantClosure(std.testing.allocator, &missing, missing[0].identity);
     defer partial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), partial.records.len);
@@ -746,7 +831,7 @@ test "closure excludes unrelated rows and marks missing ancestry incomplete" {
 
 test "closure rejects duplicate pid and wrong root identity" {
     const duplicate = [_]ProcessRecord{
-        testRecord(30, 1, 0, 30), testRecord(31, 2, 30, 30), testRecord(31, 3, 30, 30),
+        testRecord(30, 1, 0, 30), testBoundRecord(31, 2, 30, 1, 30), testBoundRecord(31, 3, 30, 1, 30),
     };
     var duplicate_result = try descendantClosure(std.testing.allocator, &duplicate, duplicate[0].identity);
     defer duplicate_result.deinit(std.testing.allocator);
@@ -759,13 +844,44 @@ test "closure rejects duplicate pid and wrong root identity" {
     try std.testing.expect(mismatch.incomplete);
 }
 
+test "parent identity binding rejects recycled parent slots" {
+    const Case = struct {
+        name: []const u8,
+        child_parent_start: u128,
+        expected_len: usize,
+    };
+    const cases = [_]Case{
+        // PID 20 was the unrelated child's parent at its read, then died and
+        // was recycled by the real descendant before that row was captured.
+        .{ .name = "recycled parent", .child_parent_start = 2, .expected_len = 2 },
+        .{ .name = "revalidated parent", .child_parent_start = 9, .expected_len = 3 },
+    };
+    for (cases) |case| {
+        const table = [_]ProcessRecord{
+            testRecord(10, 1, 0, 10),
+            testBoundRecord(20, 9, 10, 1, 10),
+            testBoundRecord(30, 3, 20, case.child_parent_start, 77),
+        };
+        var closure = try descendantClosure(std.testing.allocator, &table, table[0].identity);
+        defer closure.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.expected_len, closure.records.len);
+        try std.testing.expectEqual(case.expected_len != 3, closure.incomplete);
+
+        const captured = [_]ProcessRecord{testRecord(10, 1, 0, 10)};
+        var resweep = try resweepDescendants(std.testing.allocator, &captured, &table);
+        defer resweep.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.expected_len, resweep.records.len);
+        try std.testing.expectEqual(case.expected_len != 3, resweep.incomplete);
+    }
+}
+
 test "resweep deduplicates exact rows and rejects recycled intermediates" {
-    const captured = [_]ProcessRecord{ testRecord(40, 1, 0, 40), testRecord(41, 2, 40, 40) };
+    const captured = [_]ProcessRecord{ testRecord(40, 1, 0, 40), testBoundRecord(41, 2, 40, 1, 40) };
     const resweep = [_]ProcessRecord{
         testRecord(40, 1, 0, 40),
-        testRecord(41, 2, 40, 40),
-        testRecord(42, 3, 41, 77),
-        testRecord(42, 3, 41, 77),
+        testBoundRecord(41, 2, 40, 1, 40),
+        testBoundRecord(42, 3, 41, 2, 77),
+        testBoundRecord(42, 3, 41, 2, 77),
     };
     var result = try resweepDescendants(std.testing.allocator, &captured, &resweep);
     defer result.deinit(std.testing.allocator);
@@ -777,8 +893,8 @@ test "resweep deduplicates exact rows and rejects recycled intermediates" {
 
     const recycled_intermediate = [_]ProcessRecord{
         testRecord(40, 1, 0, 40),
-        testRecord(41, 9, 40, 40),
-        testRecord(42, 3, 41, 77),
+        testBoundRecord(41, 9, 40, 1, 40),
+        testBoundRecord(42, 3, 41, 2, 77),
     };
     var stale = try resweepDescendants(std.testing.allocator, &captured, &recycled_intermediate);
     defer stale.deinit(std.testing.allocator);
@@ -788,11 +904,11 @@ test "resweep deduplicates exact rows and rejects recycled intermediates" {
 }
 
 test "resweep permits a surviving non-root anchor and rejects conflicting rows" {
-    const captured = [_]ProcessRecord{ testRecord(50, 1, 0, 50), testRecord(51, 2, 50, 50) };
+    const captured = [_]ProcessRecord{ testRecord(50, 1, 0, 50), testBoundRecord(51, 2, 50, 1, 50) };
     const surviving_child = [_]ProcessRecord{
         testRecord(50, 9, 0, 50),
-        testRecord(51, 2, 50, 50),
-        testRecord(52, 3, 51, 77),
+        testBoundRecord(51, 2, 50, 1, 50),
+        testBoundRecord(52, 3, 51, 2, 77),
     };
     var expanded = try resweepDescendants(std.testing.allocator, &captured, &surviving_child);
     defer expanded.deinit(std.testing.allocator);
@@ -803,9 +919,9 @@ test "resweep permits a surviving non-root anchor and rejects conflicting rows" 
 
     const conflicting = [_]ProcessRecord{
         testRecord(50, 1, 0, 50),
-        testRecord(51, 2, 50, 50),
-        testRecord(51, 7, 50, 50),
-        testRecord(52, 3, 51, 77),
+        testBoundRecord(51, 2, 50, 1, 50),
+        testBoundRecord(51, 7, 50, 1, 50),
+        testBoundRecord(52, 3, 51, 2, 77),
     };
     var ambiguous = try resweepDescendants(std.testing.allocator, &captured, &conflicting);
     defer ambiguous.deinit(std.testing.allocator);
@@ -830,7 +946,7 @@ test "linux handle reader rejects a recycled proc entry and accepts an exact han
         }
     };
 
-    const old_descendant = testRecord(61, 2, 60, 60);
+    const old_descendant = testBoundRecord(61, 2, 60, 1, 60);
     const original_entry: LinuxProcEntryIdentity = .{ .inode = 6101 };
     const replacement_entry: LinuxProcEntryIdentity = .{ .inode = 6102 };
     var replacement_handle: FakeStableHandle = .{
