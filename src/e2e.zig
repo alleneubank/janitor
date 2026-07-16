@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 
 const TimeoutError = error{Timeout};
+const fixture_timeout_ms: u64 = 3000;
 
 // std.posix.tcsetpgrp/tcgetpgrp reference std.c.tc*pgrp, which is not declared
 // for macOS in Zig 0.15.2, so the test harness calls the libc symbols directly.
@@ -55,7 +56,7 @@ pub fn main() !void {
 // session/process-group leader, so it remains PPID-linked but escapes group
 // signaling. The descendant ignores TERM to make a missing individual KILL
 // deterministic.
-fn runDetachedFixture(pid_path: []const u8) !void {
+fn runDetachedFixture(control_path: []const u8) !void {
     const detached_pid = try posix.fork();
     if (detached_pid == 0) {
         if (std.c.setsid() < 0) posix.exit(90);
@@ -65,10 +66,31 @@ fn runDetachedFixture(pid_path: []const u8) !void {
         ignore_term.mask = posix.sigemptyset();
         posix.sigaction(posix.SIG.TERM, &ignore_term, null);
 
+        // The socket is the fixture's identity capability. Establish it before
+        // becoming long lived: a listener/setup failure exits this escaped
+        // child on a deadline instead of leaving a detached sentinel behind.
+        const control_fd = connectFixtureControl(control_path, fixture_timeout_ms) catch |err| {
+            std.debug.print("detached fixture control connection failed: {s}\n", .{@errorName(err)});
+            posix.exit(91);
+        };
+        defer posix.close(control_fd);
+
         var pid_buf: [64]u8 = undefined;
         const pid_contents = std.fmt.bufPrint(&pid_buf, "{d}\n", .{std.c.getpid()}) catch posix.exit(91);
-        std.fs.cwd().writeFile(.{ .sub_path = pid_path, .data = pid_contents }) catch posix.exit(91);
-        while (true) std.Thread.sleep(std.time.ns_per_s);
+        sendControlMessage(control_fd, pid_contents, fixture_timeout_ms) catch |err| {
+            std.debug.print("detached fixture readiness send failed: {s}\n", .{@errorName(err)});
+            posix.exit(92);
+        };
+
+        // Janitor's pre-fix implementation cannot reach this setsid() child,
+        // so it remains here until the harness observes that failure and asks
+        // this exact connected peer to clean up. EOF is also a cleanup request
+        // so every harness failure path releases the fixture.
+        waitForFixtureCleanup(control_fd) catch |err| {
+            std.debug.print("detached fixture control wait failed: {s}\n", .{@errorName(err)});
+            posix.exit(93);
+        };
+        return;
     }
 
     // Keep the parent side of the PPID chain alive until Janitor starts
@@ -92,8 +114,14 @@ fn testWatchPathDrainsDetachedDescendant(
     defer sandbox.deinit();
 
     const watch_path = try sandbox.path("watch");
-    const detached_pid_path = try sandbox.path("detached.pid");
+    const control_path = try sandbox.path("detached.control");
     try std.fs.cwd().writeFile(.{ .sub_path = watch_path, .data = "" });
+
+    // Bind before spawning Janitor: the child cannot enter its long-lived
+    // detached state until it owns a connected endpoint, and a setup failure
+    // makes it self-exit on its bounded connection deadline.
+    var control_listener = try FixtureControlListener.init(control_path);
+    defer control_listener.deinit();
 
     var janitor = std.process.Child.init(&.{
         janitor_exe,
@@ -106,7 +134,7 @@ fn testWatchPathDrainsDetachedDescendant(
         "--",
         e2e_exe,
         "--detached-fixture",
-        detached_pid_path,
+        control_path,
     }, allocator);
     janitor.stdin_behavior = .Ignore;
     janitor.stdout_behavior = .Ignore;
@@ -124,30 +152,23 @@ fn testWatchPathDrainsDetachedDescendant(
         }
     }
 
-    const detached_pid = try waitForPidFile(detached_pid_path, 3000);
-    var detached_cleanup_required = true;
-    defer if (detached_cleanup_required) killAndWaitForProcessGone(detached_pid);
-
-    if (!processExists(detached_pid)) {
-        // The liveness check rules out this numeric PID as our fixture. Do
-        // not let the deferred fallback race PID reuse and signal a stranger.
-        detached_cleanup_required = false;
-        std.debug.print("detached fixture pid {d} exited before teardown\n", .{detached_pid});
-        return error.DetachedFixtureNotLive;
-    }
+    var control = try control_listener.acceptWithin(fixture_timeout_ms);
+    defer control.close();
+    var control_cleanup_required = true;
+    defer if (control_cleanup_required) control.requestCleanupAndWait();
+    const diagnostic_pid = try control.receiveDiagnosticPid(fixture_timeout_ms);
+    std.debug.print("detached fixture connected (diagnostic pid {d})\n", .{diagnostic_pid});
 
     try std.fs.cwd().deleteFile(watch_path);
     const janitor_term = try waitForChildTerm(&janitor, 3000, "detached-descendant teardown");
     janitor_reaped = true;
     try expectExitedAny(janitor_term, "detached-descendant teardown exits instead of hanging");
 
-    waitForProcessGone(detached_pid, 3000) catch |err| {
-        std.debug.print("detached descendant {d} survived Janitor teardown\n", .{detached_pid});
+    control.waitForExit(fixture_timeout_ms) catch |err| {
+        std.debug.print("connected detached descendant survived Janitor teardown\n", .{});
         return err;
     };
-    // The disappearance assertion makes numeric-PID cleanup unsafe: a later
-    // PID reuse must never let this harness signal an unrelated process.
-    detached_cleanup_required = false;
+    control_cleanup_required = false;
 }
 
 // REQ-JANITOR-015: `janitor --version`, `-V`, and the `version` subcommand each
@@ -543,6 +564,209 @@ const Sandbox = struct {
         return self.writeScript(name, contents);
     }
 };
+
+// A connected Unix-domain socket is the detached fixture's identity token. The
+// diagnostic PID aids failure output only; it never authorizes a signal or a
+// liveness decision, so PID reuse cannot redirect this test's cleanup.
+const FixtureControl = struct {
+    fd: posix.fd_t,
+
+    fn close(self: *FixtureControl) void {
+        posix.close(self.fd);
+    }
+
+    fn receiveDiagnosticPid(self: *FixtureControl, timeout_ms: u64) !posix.pid_t {
+        const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+        var pid_buf: [64]u8 = undefined;
+        var pid_len: usize = 0;
+
+        while (pid_len < pid_buf.len) {
+            const events = try waitForControlEvent(self.fd, deadline_ns, posix.POLL.IN);
+            if (events & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return error.ControlConnectionFailed;
+            if (events & (posix.POLL.IN | posix.POLL.HUP) == 0) continue;
+
+            const received = posix.recv(self.fd, pid_buf[pid_len..], 0) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.ConnectionResetByPeer => return error.FixtureControlClosedBeforeReady,
+                else => return err,
+            };
+            if (received == 0) return error.FixtureControlClosedBeforeReady;
+            pid_len += received;
+
+            if (std.mem.indexOf(u8, pid_buf[0..pid_len], "\n")) |newline| {
+                return std.fmt.parseInt(posix.pid_t, pid_buf[0..newline], 10);
+            }
+        }
+
+        return error.FixtureDiagnosticTooLong;
+    }
+
+    fn waitForExit(self: *FixtureControl, timeout_ms: u64) !void {
+        const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+        while (true) {
+            const events = try waitForControlEvent(self.fd, deadline_ns, posix.POLL.IN);
+            if (events & posix.POLL.NVAL != 0) return error.ControlConnectionFailed;
+            if (events & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
+
+            var byte: [1]u8 = undefined;
+            const received = posix.recv(self.fd, &byte, 0) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.ConnectionResetByPeer => return,
+                else => return err,
+            };
+            if (received == 0) return;
+            std.debug.print("unexpected detached fixture control data: {x}\n", .{byte[0]});
+            return error.UnexpectedFixtureControlData;
+        }
+    }
+
+    // Defer paths cannot propagate errors, so report every failure explicitly.
+    // Closing this exact peer remains safe even if its diagnostic PID has long
+    // since been recycled by an unrelated process.
+    fn requestCleanupAndWait(self: *FixtureControl) void {
+        sendControlMessage(self.fd, "C", fixture_timeout_ms) catch |err| {
+            std.debug.print("detached fixture cleanup request failed: {s}\n", .{@errorName(err)});
+        };
+        posix.shutdown(self.fd, .send) catch |err| switch (err) {
+            error.SocketNotConnected => {},
+            else => std.debug.print("detached fixture cleanup shutdown failed: {s}\n", .{@errorName(err)}),
+        };
+        self.waitForExit(fixture_timeout_ms) catch |err| {
+            std.debug.print("detached fixture cleanup acknowledgment failed: {s}\n", .{@errorName(err)});
+        };
+    }
+};
+
+const FixtureControlListener = struct {
+    server: std.net.Server,
+    path: []const u8,
+
+    fn init(path: []const u8) !FixtureControlListener {
+        const address = try std.net.Address.initUnix(path);
+        return .{
+            .server = try address.listen(.{ .kernel_backlog = 1, .force_nonblocking = true }),
+            .path = path,
+        };
+    }
+
+    fn deinit(self: *FixtureControlListener) void {
+        self.server.deinit();
+        std.fs.cwd().deleteFile(self.path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.debug.print(
+                "failed to remove fixture control socket {s}: {s}\n",
+                .{ self.path, @errorName(err) },
+            ),
+        };
+        self.* = undefined;
+    }
+
+    fn acceptWithin(self: *FixtureControlListener, timeout_ms: u64) !FixtureControl {
+        const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+        while (true) {
+            const events = try waitForControlEvent(self.server.stream.handle, deadline_ns, posix.POLL.IN);
+            if (events & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return error.ControlListenerFailed;
+            if (events & posix.POLL.IN == 0) continue;
+
+            const fd = posix.accept(
+                self.server.stream.handle,
+                null,
+                null,
+                posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+            ) catch |err| switch (err) {
+                error.WouldBlock, error.ConnectionAborted => continue,
+                else => return err,
+            };
+            return .{ .fd = fd };
+        }
+    }
+};
+
+fn connectFixtureControl(path: []const u8, timeout_ms: u64) !posix.fd_t {
+    const fd = try posix.socket(
+        posix.AF.UNIX,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        0,
+    );
+    errdefer posix.close(fd);
+
+    const address = try std.net.Address.initUnix(path);
+    posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {
+            const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+            while (true) {
+                const events = try waitForControlEvent(fd, deadline_ns, posix.POLL.OUT);
+                if (events & (posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP) == 0) continue;
+                posix.getsockoptError(fd) catch |connect_err| switch (connect_err) {
+                    error.ConnectionPending => continue,
+                    else => return connect_err,
+                };
+                return fd;
+            }
+        },
+        else => return err,
+    };
+    return fd;
+}
+
+fn sendControlMessage(fd: posix.fd_t, message: []const u8, timeout_ms: u64) !void {
+    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    var sent: usize = 0;
+    while (sent < message.len) {
+        const events = try waitForControlEvent(fd, deadline_ns, posix.POLL.OUT);
+        if (events & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return error.ControlConnectionFailed;
+        if (events & posix.POLL.OUT == 0) continue;
+
+        const wrote = posix.send(fd, message[sent..], posix.MSG.NOSIGNAL) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (wrote == 0) return error.ControlConnectionClosed;
+        sent += wrote;
+    }
+}
+
+fn waitForFixtureCleanup(fd: posix.fd_t) !void {
+    var poll_fds = [1]posix.pollfd{.{
+        .fd = fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    while (true) {
+        _ = try posix.poll(&poll_fds, -1);
+        const events = poll_fds[0].revents;
+        poll_fds[0].revents = 0;
+        if (events & posix.POLL.NVAL != 0) return error.ControlConnectionFailed;
+        if (events & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
+
+        var byte: [1]u8 = undefined;
+        const received = posix.recv(fd, &byte, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+        if (received == 0 or byte[0] == 'C') return;
+        return error.UnexpectedFixtureControlData;
+    }
+}
+
+fn waitForControlEvent(fd: posix.fd_t, deadline_ns: u64, events: i16) !i16 {
+    const now_ns = monotonicNowNs();
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    const timeout_ms: i32 = @intCast(@min(
+        (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
+        @as(u64, 50),
+    ));
+
+    var poll_fds = [1]posix.pollfd{.{
+        .fd = fd,
+        .events = events,
+        .revents = 0,
+    }};
+    _ = try posix.poll(&poll_fds, timeout_ms);
+    return poll_fds[0].revents;
+}
 
 fn waitForPidFile(path: []const u8, timeout_ms: u64) !posix.pid_t {
     const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
