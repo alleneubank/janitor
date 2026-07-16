@@ -314,7 +314,7 @@ fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: [
 }
 
 fn waitForForeground(master: c_int, expected: posix.pid_t, timeout_ms: u64) !void {
-    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    const deadline_ns = deadlineAfterMs(timeout_ms);
     while (monotonicNowNs() < deadline_ns) {
         if (tcgetpgrp(master) == expected) return;
         std.Thread.sleep(20 * std.time.ns_per_ms);
@@ -576,7 +576,7 @@ const FixtureControl = struct {
     }
 
     fn receiveDiagnosticPid(self: *FixtureControl, timeout_ms: u64) !posix.pid_t {
-        const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+        const deadline_ns = deadlineAfterMs(timeout_ms);
         var pid_buf: [64]u8 = undefined;
         var pid_len: usize = 0;
 
@@ -593,8 +593,10 @@ const FixtureControl = struct {
             if (received == 0) return error.FixtureControlClosedBeforeReady;
             pid_len += received;
 
-            if (std.mem.indexOf(u8, pid_buf[0..pid_len], "\n")) |newline| {
-                return std.fmt.parseInt(posix.pid_t, pid_buf[0..newline], 10);
+            for (pid_buf[0..pid_len], 0..) |byte, newline| {
+                if (byte == '\n') {
+                    return std.fmt.parseInt(posix.pid_t, pid_buf[0..newline], 10);
+                }
             }
         }
 
@@ -602,7 +604,7 @@ const FixtureControl = struct {
     }
 
     fn waitForExit(self: *FixtureControl, timeout_ms: u64) !void {
-        const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+        const deadline_ns = deadlineAfterMs(timeout_ms);
         while (true) {
             const events = try waitForControlEvent(self.fd, deadline_ns, posix.POLL.IN);
             if (events & posix.POLL.NVAL != 0) return error.ControlConnectionFailed;
@@ -662,7 +664,7 @@ const FixtureControlListener = struct {
     }
 
     fn acceptWithin(self: *FixtureControlListener, timeout_ms: u64) !FixtureControl {
-        const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+        const deadline_ns = deadlineAfterMs(timeout_ms);
         while (true) {
             const events = try waitForControlEvent(self.server.stream.handle, deadline_ns, posix.POLL.IN);
             if (events & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return error.ControlListenerFailed;
@@ -693,7 +695,7 @@ fn connectFixtureControl(path: []const u8, timeout_ms: u64) !posix.fd_t {
     const address = try std.net.Address.initUnix(path);
     posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
         error.WouldBlock, error.ConnectionPending => {
-            const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+            const deadline_ns = deadlineAfterMs(timeout_ms);
             while (true) {
                 const events = try waitForControlEvent(fd, deadline_ns, posix.POLL.OUT);
                 if (events & (posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP) == 0) continue;
@@ -710,7 +712,7 @@ fn connectFixtureControl(path: []const u8, timeout_ms: u64) !posix.fd_t {
 }
 
 fn sendControlMessage(fd: posix.fd_t, message: []const u8, timeout_ms: u64) !void {
-    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    const deadline_ns = deadlineAfterMs(timeout_ms);
     var sent: usize = 0;
     while (sent < message.len) {
         const events = try waitForControlEvent(fd, deadline_ns, posix.POLL.OUT);
@@ -769,7 +771,7 @@ fn waitForControlEvent(fd: posix.fd_t, deadline_ns: u64, events: i16) !i16 {
 }
 
 fn waitForPidFile(path: []const u8, timeout_ms: u64) !posix.pid_t {
-    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    const deadline_ns = deadlineAfterMs(timeout_ms);
     var buf: [64]u8 = undefined;
 
     while (monotonicNowNs() < deadline_ns) {
@@ -787,7 +789,7 @@ fn waitForPidFile(path: []const u8, timeout_ms: u64) !posix.pid_t {
 }
 
 fn waitForProcessGone(pid: posix.pid_t, timeout_ms: u64) !void {
-    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    const deadline_ns = deadlineAfterMs(timeout_ms);
     while (monotonicNowNs() < deadline_ns) {
         if (!processExists(pid)) return;
         std.Thread.sleep(20 * std.time.ns_per_ms);
@@ -830,7 +832,7 @@ fn waitForChildTerm(
     timeout_ms: u64,
     context: []const u8,
 ) !std.process.Child.Term {
-    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    const deadline_ns = deadlineAfterMs(timeout_ms);
     while (monotonicNowNs() < deadline_ns) {
         const result = posix.waitpid(child.id, posix.W.NOHANG);
         if (result.pid != 0) return childTermFromWaitStatus(result.status);
@@ -901,6 +903,18 @@ fn expectExitedAny(term: std.process.Child.Term, context: []const u8) !void {
     }
 }
 
+// All fixture deadlines share this POSIX monotonic clock, not wall time. A
+// saturated deadline keeps waits bounded even if a future caller supplies a
+// timeout that cannot be represented in nanoseconds.
+fn deadlineAfterMs(timeout_ms: u64) u64 {
+    const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    return std.math.add(u64, monotonicNowNs(), timeout_ns) catch std.math.maxInt(u64);
+}
+
 fn monotonicNowNs() u64 {
-    return @intCast(std.time.nanoTimestamp());
+    const timespec = posix.clock_gettime(.MONOTONIC) catch |err| {
+        std.debug.panic("CLOCK_MONOTONIC unavailable: {s}", .{@errorName(err)});
+    };
+    const seconds_ns = std.math.mul(u64, @intCast(timespec.sec), std.time.ns_per_s) catch unreachable;
+    return std.math.add(u64, seconds_ns, @intCast(timespec.nsec)) catch unreachable;
 }
