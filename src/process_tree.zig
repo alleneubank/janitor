@@ -457,7 +457,7 @@ fn captureLinuxOne(pid: posix.pid_t) ?ProcessIdentity {
     if (comptime builtin.os.tag != .linux) return null;
     var name: [32]u8 = undefined;
     const path = std.fmt.bufPrint(&name, "/proc/{d}", .{pid}) catch return null;
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return null;
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return null;
     defer dir.close();
     const item = (readLinuxStat(dir) catch return null) orelse return null;
     if (item.identity.pid != pid) return null;
@@ -475,7 +475,7 @@ fn captureLinuxTarget(
     // The numeric directory entry is just a lead. Record its identity before
     // open, then require the retained FD to denote that same proc entry.
     const entry_identity = try linuxProcEntryIdentityAt(proc.fd, name) orelse return .incomplete;
-    var process = proc.openDir(name, .{}) catch |err| {
+    var process = proc.openDir(name, .{ .iterate = true }) catch |err| {
         _ = try linuxAcquisitionDispositionFromError(err);
         return .incomplete;
     };
@@ -496,7 +496,7 @@ fn captureLinuxTarget(
         var parent_name: [32]u8 = undefined;
         const parent_path = std.fmt.bufPrint(&parent_name, "{d}", .{provisional.ppid}) catch
             return error.SnapshotSetupFailed;
-        var parent = proc.openDir(parent_path, .{}) catch |err| {
+        var parent = proc.openDir(parent_path, .{ .iterate = true }) catch |err| {
             _ = try linuxAcquisitionDispositionFromError(err);
             return .incomplete;
         };
@@ -1068,6 +1068,20 @@ test "linux public captureIdentity path compiles" {
     if (comptime builtin.os.tag == .linux) {
         _ = captureIdentity(std.c.getpid());
     }
+}
+
+test "native current-process target liveness uses retained linux handle" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const identity = captureIdentity(std.c.getpid()) orelse return error.TestUnexpectedResult;
+    var snapshot = try captureAll(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    for (snapshot.targets) |target| {
+        if (!target.record().identity.eql(identity)) continue;
+        try std.testing.expectEqual(TargetResult.live, target.liveness());
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "native current-process identity captures and revalidates on macos" {

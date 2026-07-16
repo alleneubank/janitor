@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("janitor", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
     });
     // root.zig reads version/git_sha from here; the import travels with the
     // module to every consumer (exe, unit tests, package dependents).
@@ -36,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "janitor", .module = mod },
             },
