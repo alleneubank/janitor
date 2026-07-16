@@ -2,6 +2,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const process_tree = @import("process_tree.zig");
 // Build-time metadata: version single-sourced from build.zig.zon, git_sha
 // resolved during `zig build`. See build.zig.
 const build_info = @import("build_info");
@@ -32,7 +33,15 @@ pub const Config = struct {
     watch_pid: ?posix.pid_t = null,
     grace_ms: u64 = default_grace_ms,
     poll_ms: u64 = default_poll_ms,
+    drain_scope: DrainScope = .snapshot,
     command: []const []const u8,
+};
+
+/// Snapshot draining is the safe default. The explicit escape hatch preserves
+/// the historical behavior for programs that deliberately self-daemonize.
+pub const DrainScope = enum {
+    snapshot,
+    pgroup_only,
 };
 
 pub const ParseError = error{
@@ -81,6 +90,7 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
     var watch_pid: ?posix.pid_t = null;
     var grace_ms = default_grace_ms;
     var poll_ms = default_poll_ms;
+    var drain_scope: DrainScope = .snapshot;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -93,6 +103,7 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
                 .watch_pid = watch_pid,
                 .grace_ms = grace_ms,
                 .poll_ms = poll_ms,
+                .drain_scope = drain_scope,
                 .command = command,
             };
         } else if (std.mem.eql(u8, arg, "--watch-path")) {
@@ -113,6 +124,8 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             poll_ms = std.fmt.parseUnsigned(u64, args[i], 10) catch return error.InvalidNumber;
+        } else if (std.mem.eql(u8, arg, "--pgroup-only")) {
+            drain_scope = .pgroup_only;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return error.MissingCommand;
         } else {
@@ -151,14 +164,23 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
     defer watcher.deinit();
 
     if (getParentPid() != original_parent) {
-        return teardown(child_pid, child_pgid, config, &watcher, &child_state, .parent_exited);
+        return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .parent_exited);
     }
 
     while (true) {
         const event = watcher.wait(null) catch return error.WaitFailed;
         switch (event) {
-            .parent_exited => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .parent_exited),
+            .parent_exited => return teardown(
+                allocator,
+                child_pid,
+                child_pgid,
+                config,
+                &watcher,
+                &child_state,
+                .parent_exited,
+            ),
             .watched_pid_exited => return teardown(
+                allocator,
                 child_pid,
                 child_pgid,
                 config,
@@ -166,12 +188,20 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
                 &child_state,
                 .watched_pid_exited,
             ),
-            .path_missing => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .path_missing),
-            .signal => return teardown(child_pid, child_pgid, config, &watcher, &child_state, .signal),
+            .path_missing => return teardown(
+                allocator,
+                child_pid,
+                child_pgid,
+                config,
+                &watcher,
+                &child_state,
+                .path_missing,
+            ),
+            .signal => return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .signal),
             .child_exited => {
                 if (!tryPollChild(child_pid, &child_state)) continue;
                 if (isProcessGroupAlive(child_pgid)) {
-                    return teardown(child_pid, child_pgid, config, &watcher, &child_state, .child_exited);
+                    return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .child_exited);
                 }
 
                 return encodeStatus(child_state.exited);
@@ -182,6 +212,7 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
 }
 
 fn teardown(
+    allocator: std.mem.Allocator,
     child_pid: posix.pid_t,
     child_pgid: posix.pid_t,
     config: Config,
@@ -191,6 +222,215 @@ fn teardown(
 ) u8 {
     _ = reason;
 
+    var drain_set = DrainSet.init(allocator, config.drain_scope, child_pid, child_pgid) catch |err| {
+        std.log.warn(
+            "descendant snapshot unavailable ({s}); draining only original process group",
+            .{@errorName(err)},
+        );
+        return teardownGroupOnly(child_pid, child_pgid, config, watcher, child_state);
+    };
+    defer drain_set.deinit(allocator);
+
+    signalDrainSet(&drain_set, child_pgid, posix.SIG.TERM);
+
+    const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
+    while (monotonicNowNs() < deadline_ns) {
+        _ = tryPollChild(child_pid, child_state);
+        if (!drainSetAlive(&drain_set, child_pgid)) break;
+
+        const remaining_ms = remainingMs(deadline_ns);
+        if (remaining_ms == 0) break;
+        const event = watcher.wait(remaining_ms) catch .timeout;
+        if (event == .timeout) break;
+    }
+
+    if (drainSetAlive(&drain_set, child_pgid)) {
+        drain_set.resweep(allocator) catch |err| {
+            std.log.warn(
+                "descendant resweep unavailable ({s}); forcing only verified captured targets",
+                .{@errorName(err)},
+            );
+        };
+        signalDrainSet(&drain_set, child_pgid, posix.SIG.KILL);
+    }
+
+    while (child_state.* == .running) {
+        _ = tryPollChild(child_pid, child_state);
+        if (child_state.* != .running) break;
+        _ = watcher.wait(null) catch break;
+    }
+
+    return switch (child_state.*) {
+        .running => 128 + posix.SIG.KILL,
+        .exited => |status| encodeStatus(status),
+    };
+}
+
+/// Owns the discovery snapshots behind every individual signal capability.
+/// The original group remains separate because it is the sole wholesale group
+/// target Janitor is allowed to signal.
+const DrainSet = struct {
+    initial: ?process_tree.Snapshot = null,
+    reswept: ?process_tree.Snapshot = null,
+    captured: std.ArrayList(process_tree.ProcessRecord) = .empty,
+    escaped: std.ArrayList(*process_tree.CapturedTarget) = .empty,
+    child_pgid: posix.pid_t,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        scope: DrainScope,
+        child_pid: posix.pid_t,
+        child_pgid: posix.pid_t,
+    ) !DrainSet {
+        var result: DrainSet = .{ .child_pgid = child_pgid };
+        errdefer result.deinit(allocator);
+        if (scope == .pgroup_only) return result;
+        if (!process_tree.descendants_supported) return error.UnsupportedPlatform;
+
+        var snapshot = try process_tree.captureAll(allocator);
+        errdefer snapshot.deinit(allocator);
+        if (snapshot.incomplete) {
+            std.log.warn("descendant snapshot was incomplete; signaling only identities with proven ancestry", .{});
+        }
+        const child = findTargetByPid(snapshot.targets, child_pid) orelse return error.ChildNotInSnapshot;
+        try appendEscapedClosure(
+            allocator,
+            &result.captured,
+            &result.escaped,
+            snapshot.targets,
+            child.record(),
+            child_pgid,
+        );
+        result.initial = snapshot;
+        return result;
+    }
+
+    fn deinit(self: *DrainSet, allocator: std.mem.Allocator) void {
+        self.escaped.deinit(allocator);
+        self.captured.deinit(allocator);
+        if (self.reswept) |*snapshot| snapshot.deinit(allocator);
+        if (self.initial) |*snapshot| snapshot.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// One bounded refresh immediately before KILL narrows the TERM-to-KILL
+    /// spawn race. It adds only targets anchored under still-matching records.
+    fn resweep(self: *DrainSet, allocator: std.mem.Allocator) !void {
+        if (self.initial == null or self.reswept != null) return;
+        var snapshot = try process_tree.captureAll(allocator);
+        errdefer snapshot.deinit(allocator);
+        if (snapshot.incomplete) {
+            std.log.warn("descendant resweep was incomplete; adding only proven identities", .{});
+        }
+        var current = std.ArrayList(process_tree.ProcessRecord).empty;
+        defer current.deinit(allocator);
+        for (snapshot.targets) |target| try current.append(allocator, target.record());
+        var discovered = try process_tree.resweepDescendants(allocator, self.captured.items, current.items);
+        defer discovered.deinit(allocator);
+        if (discovered.incomplete) {
+            std.log.warn("descendant resweep could not prove every ancestry link", .{});
+        }
+        for (discovered.records) |record| {
+            if (!record.isEscaped(self.child_pgid)) continue;
+            const target = findTargetByIdentity(snapshot.targets, record.identity) orelse continue;
+            try appendUniqueTarget(allocator, &self.escaped, target);
+        }
+        self.reswept = snapshot;
+    }
+};
+
+fn appendEscapedClosure(
+    allocator: std.mem.Allocator,
+    captured: *std.ArrayList(process_tree.ProcessRecord),
+    escaped: *std.ArrayList(*process_tree.CapturedTarget),
+    targets: []const *process_tree.CapturedTarget,
+    child: process_tree.ProcessRecord,
+    child_pgid: posix.pid_t,
+) !void {
+    var records = std.ArrayList(process_tree.ProcessRecord).empty;
+    defer records.deinit(allocator);
+    for (targets) |target| try records.append(allocator, target.record());
+    var closure = try process_tree.descendantClosure(allocator, records.items, child.identity);
+    defer closure.deinit(allocator);
+    if (closure.incomplete) {
+        std.log.warn("descendant snapshot could not prove every ancestry link", .{});
+    }
+    for (closure.records) |record| {
+        try appendUniqueRecord(allocator, captured, record);
+        if (!record.isEscaped(child_pgid)) continue;
+        const target = findTargetByIdentity(targets, record.identity) orelse continue;
+        try appendUniqueTarget(allocator, escaped, target);
+    }
+}
+
+fn appendUniqueRecord(
+    allocator: std.mem.Allocator,
+    records: *std.ArrayList(process_tree.ProcessRecord),
+    candidate: process_tree.ProcessRecord,
+) !void {
+    for (records.items) |known| if (known.identity.eql(candidate.identity)) return;
+    try records.append(allocator, candidate);
+}
+
+fn findTargetByPid(
+    targets: []const *process_tree.CapturedTarget,
+    pid: posix.pid_t,
+) ?*process_tree.CapturedTarget {
+    for (targets) |target| if (target.record().identity.pid == pid) return target;
+    return null;
+}
+
+fn findTargetByIdentity(
+    targets: []const *process_tree.CapturedTarget,
+    identity: process_tree.ProcessIdentity,
+) ?*process_tree.CapturedTarget {
+    for (targets) |target| if (target.record().identity.eql(identity)) return target;
+    return null;
+}
+
+fn appendUniqueTarget(
+    allocator: std.mem.Allocator,
+    targets: *std.ArrayList(*process_tree.CapturedTarget),
+    target: *process_tree.CapturedTarget,
+) !void {
+    for (targets.items) |known| if (known.record().identity.eql(target.record().identity)) return;
+    try targets.append(allocator, target);
+}
+
+fn signalDrainSet(drain_set: *const DrainSet, child_pgid: posix.pid_t, signal: u8) void {
+    // This remains the existing group fast path; escaped descendants are never
+    // promoted into a group signal target.
+    signalProcessGroup(child_pgid, signal);
+    for (drain_set.escaped.items) |target| {
+        switch (target.signal(signal)) {
+            .signaled, .gone, .stale => {},
+            else => |result| std.log.warn(
+                "skipped verified descendant during signal {d}: {s}",
+                .{ signal, @tagName(result) },
+            ),
+        }
+    }
+}
+
+fn drainSetAlive(drain_set: *const DrainSet, child_pgid: posix.pid_t) bool {
+    if (isProcessGroupAlive(child_pgid)) return true;
+    for (drain_set.escaped.items) |target| {
+        switch (target.liveness()) {
+            .live => return true,
+            .gone, .stale => {},
+            else => |result| std.log.warn("could not verify captured descendant liveness: {s}", .{@tagName(result)}),
+        }
+    }
+    return false;
+}
+
+fn teardownGroupOnly(
+    child_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+    config: Config,
+    watcher: *Watcher,
+    child_state: *ChildState,
+) u8 {
     if (isProcessGroupAlive(child_pgid)) {
         signalProcessGroup(child_pgid, posix.SIG.TERM);
 
@@ -743,6 +983,14 @@ test "parse accepts watch pid" {
     const parsed = try parseArgs(args);
     try std.testing.expectEqual(@as(posix.pid_t, 4321), parsed.watch_pid.?);
     try std.testing.expectEqualStrings("sh", parsed.command[0]);
+}
+
+test "parse defaults to snapshot draining and accepts pgroup-only" {
+    const default_config = try parseArgs(&.{ "--", "true" });
+    try std.testing.expectEqual(DrainScope.snapshot, default_config.drain_scope);
+
+    const pgroup_only_config = try parseArgs(&.{ "--pgroup-only", "--", "true" });
+    try std.testing.expectEqual(DrainScope.pgroup_only, pgroup_only_config.drain_scope);
 }
 
 test "parse rejects invalid watch pid" {

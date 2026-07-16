@@ -47,7 +47,8 @@ pub fn main() !void {
     try testSignalKillsProcessGroup(allocator, janitor_exe);
     try testParentDeathKillsProcessGroup(allocator, janitor_exe);
     try testInteractiveForegroundHandoff(allocator, janitor_exe);
-    try testWatchPathDrainsDetachedDescendant(allocator, janitor_exe, e2e_exe);
+    try testWatchPathDetachedDescendant(allocator, janitor_exe, e2e_exe, false);
+    try testWatchPathDetachedDescendant(allocator, janitor_exe, e2e_exe, true);
 }
 
 // This fixture intentionally lives in the e2e executable rather than Janitor:
@@ -101,16 +102,19 @@ fn runDetachedFixture(control_path: []const u8) !void {
 
 fn ignoreSignal(_: c_int) callconv(.c) void {}
 
-// REQ-JANITOR-017 / REQ-JANITOR-019: default teardown must drain a live
-// descendant that escaped Janitor's original child group via setsid(). The
-// current group-only implementation deliberately fails this assertion; the
-// deferred cleanup bounds the red harness so it never leaks its sentinel.
-fn testWatchPathDrainsDetachedDescendant(
+// REQ-JANITOR-017 through REQ-JANITOR-020: default teardown drains a live
+// detached descendant, while the explicit `--pgroup-only` policy leaves that
+// same identity-connected sentinel outside Janitor's drain set.
+fn testWatchPathDetachedDescendant(
     allocator: std.mem.Allocator,
     janitor_exe: []const u8,
     e2e_exe: []const u8,
+    pgroup_only: bool,
 ) !void {
-    var sandbox = try Sandbox.init(allocator, "detached-descendant");
+    var sandbox = try Sandbox.init(
+        allocator,
+        if (pgroup_only) "detached-pgroup-only" else "detached-descendant",
+    );
     defer sandbox.deinit();
 
     const watch_path = try sandbox.path("watch");
@@ -123,7 +127,9 @@ fn testWatchPathDrainsDetachedDescendant(
     var control_listener = try FixtureControlListener.init(control_path);
     defer control_listener.deinit();
 
-    var janitor = std.process.Child.init(&.{
+    var arguments = std.ArrayList([]const u8).empty;
+    defer arguments.deinit(allocator);
+    try arguments.appendSlice(allocator, &.{
         janitor_exe,
         "--watch-path",
         watch_path,
@@ -131,11 +137,11 @@ fn testWatchPathDrainsDetachedDescendant(
         "150",
         "--poll-ms",
         "20",
-        "--",
-        e2e_exe,
-        "--detached-fixture",
-        control_path,
-    }, allocator);
+    });
+    if (pgroup_only) try arguments.append(allocator, "--pgroup-only");
+    try arguments.appendSlice(allocator, &.{ "--", e2e_exe, "--detached-fixture", control_path });
+
+    var janitor = std.process.Child.init(arguments.items, allocator);
     janitor.stdin_behavior = .Ignore;
     janitor.stdout_behavior = .Ignore;
     janitor.stderr_behavior = .Inherit;
@@ -164,11 +170,17 @@ fn testWatchPathDrainsDetachedDescendant(
     janitor_reaped = true;
     try expectExitedAny(janitor_term, "detached-descendant teardown exits instead of hanging");
 
-    control.waitForExit(fixture_timeout_ms) catch |err| {
-        std.debug.print("connected detached descendant survived Janitor teardown\n", .{});
-        return err;
-    };
-    control_cleanup_required = false;
+    if (pgroup_only) {
+        try std.testing.expectError(error.Timeout, control.waitForExit(250));
+        control.requestCleanupAndWait();
+        control_cleanup_required = false;
+    } else {
+        control.waitForExit(fixture_timeout_ms) catch |err| {
+            std.debug.print("connected detached descendant survived default Janitor teardown\n", .{});
+            return err;
+        };
+        control_cleanup_required = false;
+    }
 }
 
 // REQ-JANITOR-015: `janitor --version`, `-V`, and the `version` subcommand each

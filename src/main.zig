@@ -68,12 +68,15 @@ fn printUsage(err: ?janitor.ParseError) void {
     }
 
     std.debug.print(
-        \\usage: janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+        \\usage: janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS]
+        \\               [--poll-ms MS] [--pgroup-only] -- CMD [ARGS...]
         \\   or: janitor version | --version | -V
         \\
         \\Runs CMD in a new process group. If janitor's parent changes, a watched
         \\path disappears, a watched PID exits, or janitor receives TERM/INT/HUP,
-        \\it drains the child process group with SIGTERM, a grace window, then SIGKILL.
+        \\it snapshots live descendants, then drains the child process group and any
+        \\identity-verified escaped descendants with SIGTERM, a grace window, then SIGKILL.
+        \\Use --pgroup-only to retain historical child-process-group-only teardown.
         \\
     , .{});
 }

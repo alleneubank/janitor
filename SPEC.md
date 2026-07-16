@@ -282,9 +282,9 @@ the original child process group.
       fails open on malformed input.
 - [x] The Claude Code plugin manifest and hooks JSON are valid and register the
       expected hooks.
-- [ ] Default teardown snapshots a live `setsid()` descendant before TERM and
+- [x] Default teardown snapshots a live `setsid()` descendant before TERM and
       drains it with the full drain set.
-- [ ] `--pgroup-only` retains process-group-only teardown and leaves an escaped
+- [x] `--pgroup-only` retains process-group-only teardown and leaves an escaped
       descendant outside Janitor's drain set.
 - [ ] An identity mismatch or PID-reuse candidate is skipped and diagnosed;
       the original group still drains.
@@ -343,12 +343,14 @@ the original child process group.
 - REQ-PLUGIN-007: `src/cc_hook.zig` `resolveClaudePidWalk` and `isShellComm`
   tests.
 - REQ-JANITOR-017, REQ-JANITOR-019, REQ-JANITOR-020, REQ-JANITOR-024,
-  REQ-JANITOR-025: planned compiled-binary `src/e2e.zig` detached-descendant
-  teardown coverage.
-- REQ-JANITOR-018: planned `src/root.zig` CLI parsing coverage and compiled-
-  binary `src/e2e.zig` opt-out coverage.
-- REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023: planned process-tree unit
-  coverage for identity validation, PID reuse, bounded resweep, incomplete
-  discovery, and unrelated-process exclusion.
-- REQ-JANITOR-026: planned native-platform verification and supported-target
-  build coverage.
+  REQ-JANITOR-025: compiled-binary `src/e2e.zig`
+  `testWatchPathDetachedDescendant` default-mode coverage.
+- REQ-JANITOR-018: `src/root.zig` `parse defaults to snapshot draining and
+  accepts pgroup-only` and compiled-binary `src/e2e.zig`
+  `testWatchPathDetachedDescendant` opt-out coverage.
+- REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023:
+  `src/process_tree.zig` identity-validation, PID-reuse, bounded-resweep,
+  incomplete-discovery, and unrelated-process-exclusion unit coverage; plus
+  `src/root.zig` drain-set diagnostics and capture fallback.
+- REQ-JANITOR-026: `src/root.zig` explicit unsupported-platform diagnostic and
+  `nix develop -c zig build -Dtarget=x86_64-linux` supported-target build.

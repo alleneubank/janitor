@@ -19,8 +19,10 @@ keep ports, files, databases, and CPU alive.
 1. Capture the original parent PID.
 2. Spawn the command as a new process-group leader.
 3. Watch the parent, child, signals, and optional worktree path.
-4. On any death trigger, send `SIGTERM` to the child process group.
-5. Wait for the grace window, then send `SIGKILL` if anything remains.
+4. On any death trigger, snapshot the direct child's live PPID descendants.
+5. Send `SIGTERM` to the child process group and individually to verified
+   descendants that escaped it.
+6. Wait for the grace window, then send `SIGKILL` if anything remains.
 
 ## Install
 
@@ -53,7 +55,7 @@ JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 ## Usage
 
 ```sh
-janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] [--pgroup-only] -- CMD [ARGS...]
 janitor version | --version | -V
 ```
 
@@ -81,6 +83,13 @@ directly is more reliable than relying on `janitor`'s immediate parent.
 supported platforms, the active watcher is event-driven and does not use
 periodic idle polling.
 
+By default, teardown snapshots the direct child's live PPID-linked descendants
+before sending `SIGTERM`. Janitor keeps its original process-group fast path,
+and only individually signals an escaped descendant after platform identity
+verification proves it is the captured process. Use `--pgroup-only` to opt out
+and retain the historical behavior that drains only the original child process
+group.
+
 ## Platform Behavior
 
 - macOS and BSD use `kqueue` for process, signal, vnode, and timeout waits.
@@ -89,8 +98,10 @@ periodic idle polling.
   target, use `EVFILT_PROC` / `NOTE_EXIT` on macOS/BSD and `pidfd` on Linux.
 - Windows is not supported.
 
-The child command is started in a new process group. Teardown only signals that
-group, so unrelated processes are not touched.
+The child command is started in a new process group. Janitor signals only that
+group wholesale; escaped descendants are individually addressed through their
+captured identity. Unsupported descendant-discovery backends diagnose the
+limitation and retain group-only teardown rather than guessing at targets.
 
 ## Claude Code plugin
 
@@ -118,8 +129,11 @@ configuration knobs.
 
 ## Limitations
 
-- A descendant that deliberately calls `setsid()` or moves to another process
-  group can escape. Wrap that daemon with its own `janitor` if it self-daemonizes.
+- Snapshot ownership covers only descendants still PPID-linked to the direct
+  child before teardown begins. A process already reparented before that point
+  is outside the recovery guarantee.
+- Use `--pgroup-only` when a deliberately self-daemonizing child must remain
+  outside Janitor's teardown scope.
 - `SIGKILL` sent directly to `janitor` cannot be handled by any userspace
   wrapper, so cleanup is impossible in that one case.
 - The exit status follows the direct child when available. Signal deaths are
