@@ -26,12 +26,19 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--detached-fixture")) {
+        return runDetachedFixture(args[2]);
+    }
+
     if (args.len != 2) {
         std.debug.print("usage: e2e <janitor-exe>\n", .{});
         std.process.exit(2);
     }
 
     const janitor_exe = args[1];
+    const e2e_exe = try std.fs.cwd().realpathAlloc(allocator, args[0]);
+    defer allocator.free(e2e_exe);
+
     try testVersionCommand(allocator, janitor_exe);
     try testNormalExit(allocator, janitor_exe);
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
@@ -39,6 +46,99 @@ pub fn main() !void {
     try testSignalKillsProcessGroup(allocator, janitor_exe);
     try testParentDeathKillsProcessGroup(allocator, janitor_exe);
     try testInteractiveForegroundHandoff(allocator, janitor_exe);
+    try testWatchPathDrainsDetachedDescendant(allocator, janitor_exe, e2e_exe);
+}
+
+// This fixture intentionally lives in the e2e executable rather than Janitor:
+// production behavior must not acquire a test-only command. Its direct helper
+// remains in Janitor's child group while the forked descendant becomes a fresh
+// session/process-group leader, so it remains PPID-linked but escapes group
+// signaling. The descendant ignores TERM to make a missing individual KILL
+// deterministic.
+fn runDetachedFixture(pid_path: []const u8) !void {
+    const detached_pid = try posix.fork();
+    if (detached_pid == 0) {
+        if (std.c.setsid() < 0) posix.exit(90);
+
+        var ignore_term = std.mem.zeroes(posix.Sigaction);
+        ignore_term.handler = .{ .handler = ignoreSignal };
+        ignore_term.mask = posix.sigemptyset();
+        posix.sigaction(posix.SIG.TERM, &ignore_term, null);
+
+        var pid_buf: [64]u8 = undefined;
+        const pid_contents = std.fmt.bufPrint(&pid_buf, "{d}\n", .{std.c.getpid()}) catch posix.exit(91);
+        std.fs.cwd().writeFile(.{ .sub_path = pid_path, .data = pid_contents }) catch posix.exit(91);
+        while (true) std.Thread.sleep(std.time.ns_per_s);
+    }
+
+    // Keep the parent side of the PPID chain alive until Janitor starts
+    // teardown; otherwise this would cover the explicitly excluded already-
+    // reparented case instead of the live-descendant contract.
+    while (true) std.Thread.sleep(std.time.ns_per_s);
+}
+
+fn ignoreSignal(_: c_int) callconv(.c) void {}
+
+// REQ-JANITOR-017 / REQ-JANITOR-019: default teardown must drain a live
+// descendant that escaped Janitor's original child group via setsid(). The
+// current group-only implementation deliberately fails this assertion; the
+// deferred cleanup bounds the red harness so it never leaks its sentinel.
+fn testWatchPathDrainsDetachedDescendant(
+    allocator: std.mem.Allocator,
+    janitor_exe: []const u8,
+    e2e_exe: []const u8,
+) !void {
+    var sandbox = try Sandbox.init(allocator, "detached-descendant");
+    defer sandbox.deinit();
+
+    const watch_path = try sandbox.path("watch");
+    const detached_pid_path = try sandbox.path("detached.pid");
+    try std.fs.cwd().writeFile(.{ .sub_path = watch_path, .data = "" });
+
+    var janitor = std.process.Child.init(&.{
+        janitor_exe,
+        "--watch-path",
+        watch_path,
+        "--grace-ms",
+        "150",
+        "--poll-ms",
+        "20",
+        "--",
+        e2e_exe,
+        "--detached-fixture",
+        detached_pid_path,
+    }, allocator);
+    janitor.stdin_behavior = .Ignore;
+    janitor.stdout_behavior = .Ignore;
+    janitor.stderr_behavior = .Inherit;
+    try janitor.spawn();
+
+    var janitor_reaped = false;
+    defer {
+        if (!janitor_reaped) {
+            // Let Janitor run its normal signal teardown before forcefully
+            // reaping it, so a pre-readiness failure does not strand its child.
+            posix.kill(janitor.id, posix.SIG.TERM) catch {};
+            _ = janitor.wait() catch {};
+        }
+    }
+
+    const detached_pid = try waitForPidFile(detached_pid_path, 3000);
+    defer killAndWaitForProcessGone(detached_pid);
+
+    if (!processExists(detached_pid)) {
+        std.debug.print("detached fixture pid {d} exited before teardown\n", .{detached_pid});
+        return error.DetachedFixtureNotLive;
+    }
+
+    try std.fs.cwd().deleteFile(watch_path);
+    try expectExitedAny(try janitor.wait(), "detached-descendant teardown exits instead of hanging");
+    janitor_reaped = true;
+
+    waitForProcessGone(detached_pid, 3000) catch |err| {
+        std.debug.print("detached descendant {d} survived Janitor teardown\n", .{detached_pid});
+        return err;
+    };
 }
 
 // REQ-JANITOR-015: `janitor --version`, `-V`, and the `version` subcommand each
@@ -470,6 +570,19 @@ fn processExists(pid: posix.pid_t) bool {
         else => return true,
     };
     return true;
+}
+
+fn killAndWaitForProcessGone(pid: posix.pid_t) void {
+    // The red harness intentionally exposes a survivor. Always force it down
+    // after the assertion (or any earlier failure) and wait a bounded time so
+    // the sandbox deletion cannot hide a leaked process.
+    posix.kill(pid, posix.SIG.KILL) catch |err| switch (err) {
+        error.ProcessNotFound => return,
+        else => return,
+    };
+    waitForProcessGone(pid, 3000) catch |err| {
+        std.debug.print("warning: detached fixture pid {d} survived cleanup: {s}\n", .{ pid, @errorName(err) });
+    };
 }
 
 fn expectExited(term: std.process.Child.Term, expected: u8, context: []const u8) !void {
