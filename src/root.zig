@@ -223,10 +223,7 @@ fn teardown(
     _ = reason;
 
     var drain_set = DrainSet.init(allocator, config.drain_scope, child_pid, child_pgid) catch |err| {
-        std.log.warn(
-            "descendant snapshot unavailable ({s}); draining only original process group",
-            .{@errorName(err)},
-        );
+        reportDiscoveryDecision(discoveryDecision(.capture_failed), @errorName(err));
         return teardownGroupOnly(child_pid, child_pgid, config, watcher, child_state);
     };
     defer drain_set.deinit(allocator);
@@ -266,6 +263,91 @@ fn teardown(
     };
 }
 
+/// Teardown always retains the original child group. Discovery can only add
+/// identity-verified individual targets; it can never make group cleanup
+/// conditional on a snapshot succeeding.
+const DiscoveryResult = enum {
+    complete,
+    incomplete,
+    capture_failed,
+};
+
+const OriginalGroupCleanup = enum {
+    retain,
+};
+
+const TeardownDiagnostic = enum {
+    incomplete_discovery,
+    capture_failed,
+    identity_mismatch,
+    target_unavailable,
+};
+
+const DiscoveryDecision = struct {
+    original_group_cleanup: OriginalGroupCleanup = .retain,
+    diagnostic: ?TeardownDiagnostic = null,
+};
+
+/// This policy is deliberately pure: unit tests can prove that failures retain
+/// original-group cleanup without manufacturing process-tree capabilities.
+fn discoveryDecision(result: DiscoveryResult) DiscoveryDecision {
+    return switch (result) {
+        .complete => .{},
+        .incomplete => .{ .diagnostic = .incomplete_discovery },
+        .capture_failed => .{ .diagnostic = .capture_failed },
+    };
+}
+
+fn reportDiscoveryDecision(decision: DiscoveryDecision, detail: ?[]const u8) void {
+    switch (decision.diagnostic orelse return) {
+        .incomplete_discovery => std.log.warn(
+            "descendant snapshot was incomplete; signaling only identities with proven ancestry",
+            .{},
+        ),
+        .capture_failed => std.log.warn(
+            "descendant snapshot unavailable ({s}); draining only original process group",
+            .{detail orelse "unknown"},
+        ),
+        else => unreachable,
+    }
+}
+
+const TargetDecision = union(enum) {
+    live,
+    done,
+    diagnostic: TeardownDiagnostic,
+};
+
+/// Converts side-effect results into diagnostics at the supervision boundary.
+/// A stale result specifically means the captured `(pid, start_time)` no
+/// longer identifies the process, and must never degrade into a silent skip.
+fn targetDecision(result: process_tree.TargetResult) TargetDecision {
+    return switch (result) {
+        .live => .live,
+        .signaled, .gone => .done,
+        .stale => .{ .diagnostic = .identity_mismatch },
+        else => .{ .diagnostic = .target_unavailable },
+    };
+}
+
+fn reportTargetDecision(decision: TargetDecision, operation: []const u8) void {
+    const diagnostic = switch (decision) {
+        .diagnostic => |value| value,
+        else => return,
+    };
+    switch (diagnostic) {
+        .identity_mismatch => std.log.warn(
+            "captured descendant identity mismatch during {s}; skipped individual target",
+            .{operation},
+        ),
+        .target_unavailable => std.log.warn(
+            "could not verify captured descendant during {s}",
+            .{operation},
+        ),
+        else => unreachable,
+    }
+}
+
 /// Owns the discovery snapshots behind every individual signal capability.
 /// The original group remains separate because it is the sole wholesale group
 /// target Janitor is allowed to signal.
@@ -289,9 +371,7 @@ const DrainSet = struct {
 
         var snapshot = try process_tree.captureAll(allocator);
         errdefer snapshot.deinit(allocator);
-        if (snapshot.incomplete) {
-            std.log.warn("descendant snapshot was incomplete; signaling only identities with proven ancestry", .{});
-        }
+        reportDiscoveryDecision(discoveryDecision(if (snapshot.incomplete) .incomplete else .complete), null);
         const child = findTargetByPid(snapshot.targets, child_pid) orelse return error.ChildNotInSnapshot;
         try appendEscapedClosure(
             allocator,
@@ -402,23 +482,20 @@ fn signalDrainSet(drain_set: *const DrainSet, child_pgid: posix.pid_t, signal: u
     // promoted into a group signal target.
     signalProcessGroup(child_pgid, signal);
     for (drain_set.escaped.items) |target| {
-        switch (target.signal(signal)) {
-            .signaled, .gone, .stale => {},
-            else => |result| std.log.warn(
-                "skipped verified descendant during signal {d}: {s}",
-                .{ signal, @tagName(result) },
-            ),
-        }
+        reportTargetDecision(targetDecision(target.signal(signal)), "individual signal");
     }
 }
 
 fn drainSetAlive(drain_set: *const DrainSet, child_pgid: posix.pid_t) bool {
     if (isProcessGroupAlive(child_pgid)) return true;
     for (drain_set.escaped.items) |target| {
-        switch (target.liveness()) {
+        switch (targetDecision(target.liveness())) {
             .live => return true,
-            .gone, .stale => {},
-            else => |result| std.log.warn("could not verify captured descendant liveness: {s}", .{@tagName(result)}),
+            .done => {},
+            .diagnostic => |diagnostic| reportTargetDecision(
+                .{ .diagnostic = diagnostic },
+                "liveness probe",
+            ),
         }
     }
     return false;
@@ -1013,4 +1090,30 @@ test "versionLine renders version and git sha" {
     try std.testing.expect(std.mem.indexOf(u8, line, git_sha) != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, line, '(') != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, line, ')') != null);
+}
+
+test "discovery decisions diagnose limitations and retain original group cleanup" {
+    const cases = [_]struct {
+        result: DiscoveryResult,
+        diagnostic: ?TeardownDiagnostic,
+    }{
+        .{ .result = .incomplete, .diagnostic = .incomplete_discovery },
+        .{ .result = .capture_failed, .diagnostic = .capture_failed },
+    };
+
+    for (cases) |case| {
+        const decision = discoveryDecision(case.result);
+        try std.testing.expectEqual(OriginalGroupCleanup.retain, decision.original_group_cleanup);
+        try std.testing.expectEqual(case.diagnostic, decision.diagnostic);
+    }
+}
+
+test "stale descendant identity is diagnosed and retains original group cleanup" {
+    const decision = targetDecision(.stale);
+    const expected: TargetDecision = .{ .diagnostic = .identity_mismatch };
+    try std.testing.expectEqual(expected, decision);
+    try std.testing.expectEqual(
+        OriginalGroupCleanup.retain,
+        discoveryDecision(.complete).original_group_cleanup,
+    );
 }

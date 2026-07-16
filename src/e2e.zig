@@ -168,7 +168,7 @@ fn testWatchPathDetachedDescendant(
     try std.fs.cwd().deleteFile(watch_path);
     const janitor_term = try waitForChildTerm(&janitor, 3000, "detached-descendant teardown");
     janitor_reaped = true;
-    try expectExitedAny(janitor_term, "detached-descendant teardown exits instead of hanging");
+    try expectExited(janitor_term, 128 + posix.SIG.TERM, "detached-descendant teardown preserves direct child status");
 
     if (pgroup_only) {
         try std.testing.expectError(error.Timeout, control.waitForExit(250));

@@ -344,13 +344,16 @@ the original child process group.
   tests.
 - REQ-JANITOR-017, REQ-JANITOR-019, REQ-JANITOR-020, REQ-JANITOR-024,
   REQ-JANITOR-025: compiled-binary `src/e2e.zig`
-  `testWatchPathDetachedDescendant` default-mode coverage.
+  `testWatchPathDetachedDescendant` default-mode and `--pgroup-only` coverage,
+  which each require Janitor to preserve the direct child's SIGTERM status.
 - REQ-JANITOR-018: `src/root.zig` `parse defaults to snapshot draining and
   accepts pgroup-only` and compiled-binary `src/e2e.zig`
   `testWatchPathDetachedDescendant` opt-out coverage.
 - REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023:
   `src/process_tree.zig` identity-validation, PID-reuse, bounded-resweep,
   incomplete-discovery, and unrelated-process-exclusion unit coverage; plus
-  `src/root.zig` drain-set diagnostics and capture fallback.
+  `src/root.zig` `discovery decisions diagnose limitations and retain original
+  group cleanup` and `stale descendant identity is diagnosed and retains
+  original group cleanup` integration-policy tests.
 - REQ-JANITOR-026: `src/root.zig` explicit unsupported-platform diagnostic and
   `nix develop -c zig build -Dtarget=x86_64-linux` supported-target build.
