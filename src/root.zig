@@ -220,9 +220,10 @@ fn teardown(
     child_state: *ChildState,
     reason: TeardownReason,
 ) u8 {
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&stderr_buffer);
-    defer stderr.interface.flush() catch {};
+    // Teardown diagnostics are safety disclosures, so every reporter writes
+    // through an unbuffered stderr interface. A deferred flush could fail
+    // after a reporter had accepted bytes and make that disclosure disappear.
+    var stderr = std.fs.File.stderr().writer(&.{});
 
     return teardownWithDiagnostics(
         allocator,
@@ -333,16 +334,27 @@ fn executeDiscoveryPlan(
     if (plan.signal_original_group) signal_group(child_pgid, signal);
 }
 
+/// Writes one diagnostic completely before returning its error to the caller.
+/// This keeps injected buffered writers honest too: a flush failure takes the
+/// same fallback path as an immediate write failure.
+fn writeDiagnostic(comptime format: []const u8, writer: *std.Io.Writer, args: anytype) ?std.Io.Writer.Error {
+    writer.print(format, args) catch return error.WriteFailed;
+    writer.flush() catch return error.WriteFailed;
+    return null;
+}
+
 fn reportDiscoveryPlan(writer: *std.Io.Writer, plan: DiscoveryPlan, detail: ?[]const u8) void {
     switch (plan.diagnostic orelse return) {
-        .incomplete_discovery => writer.print(
+        .incomplete_discovery => if (writeDiagnostic(
             "janitor: descendant snapshot was incomplete; signaling only identities with proven ancestry\n",
+            writer,
             .{},
-        ) catch |err| reportDiagnosticWriteFailure(err),
-        .capture_failed => writer.print(
+        )) |err| reportDiagnosticWriteFailure(err),
+        .capture_failed => if (writeDiagnostic(
             "janitor: descendant snapshot unavailable ({s}); draining only original process group\n",
+            writer,
             .{detail orelse "unknown"},
-        ) catch |err| reportDiagnosticWriteFailure(err),
+        )) |err| reportDiagnosticWriteFailure(err),
         else => unreachable,
     }
 }
@@ -371,14 +383,16 @@ fn reportTargetDecision(writer: *std.Io.Writer, decision: TargetDecision, operat
         else => return,
     };
     switch (diagnostic) {
-        .identity_mismatch => writer.print(
+        .identity_mismatch => if (writeDiagnostic(
             "janitor: captured descendant identity mismatch during {s}; skipped individual target\n",
+            writer,
             .{operation},
-        ) catch |err| reportDiagnosticWriteFailure(err),
-        .target_unavailable => writer.print(
+        )) |err| reportDiagnosticWriteFailure(err),
+        .target_unavailable => if (writeDiagnostic(
             "janitor: could not verify captured descendant during {s}\n",
+            writer,
             .{operation},
-        ) catch |err| reportDiagnosticWriteFailure(err),
+        )) |err| reportDiagnosticWriteFailure(err),
         else => unreachable,
     }
 }
@@ -1188,4 +1202,10 @@ test "stale descendant identity from completed discovery is diagnosed" {
     reportTargetDecision(&writer, decision, "individual signal");
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "identity mismatch") != null);
     try std.testing.expect(plan.signal_original_group);
+}
+
+test "diagnostic writer failures are surfaced immediately" {
+    var writer: std.Io.Writer = .failing;
+    const failure = writeDiagnostic("janitor: test diagnostic\n", &writer, .{});
+    try std.testing.expectEqual(error.WriteFailed, failure.?);
 }
