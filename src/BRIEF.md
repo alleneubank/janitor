@@ -20,9 +20,12 @@ set without risking a signal to an unrelated process.
   descendant, while `--pgroup-only` preserves the process-group-only escape
   hatch; fixtures clean up every process on failure.
 - Native-platform verification proves the documented identity and individual
-  signaling path on every advertised descendant-drain platform. An unsupported
-  path is a fail-closed documentation or implementation block, not a silent
-  fallback.
+  signaling path on every advertised descendant-drain platform: Linux holds and
+  signals through pidfds; Darwin/BSD capture start time and immediately
+  re-read `(pid, start_time)` before `kill(pid, signal)`. Darwin/BSD's
+  validation-to-`kill` TOCTOU is documented as a native limit, not claimed
+  away. An unsupported path is a fail-closed documentation or implementation
+  block, not a silent fallback.
 - Diagnostics tests prove incomplete discovery still drains the original group,
   reports the limitation, and never broadens individual signal targets.
 
@@ -35,8 +38,11 @@ oracle is the implementing agent's self-assessment.
 
 ## Never
 
-- Never signal a process whose captured identity no longer matches; PID reuse
-  and unrelated-process signaling are hard failures.
+- Never knowingly signal an individual target whose required platform identity
+  verification is mismatched, unavailable, or stale. Linux pidfds prevent PID
+  reuse from redirecting an individual signal; Darwin/BSD must immediately
+  re-read `(pid, start_time)` before `kill(pid, signal)` and must document the
+  unavoidable validation-to-`kill` TOCTOU.
 - Never signal a process group other than the original group Janitor created.
 - Never let incomplete discovery block original-group cleanup, silently claim
   complete coverage, or broaden the signal set by guesswork.
@@ -50,8 +56,10 @@ oracle is the implementing agent's self-assessment.
 - Janitor snapshots the live PPID-linked closure before the first TERM; only the
   original child group is signaled wholesale.
 - Descendant drain is the default. `--pgroup-only` is the explicit escape hatch.
-- Linux uses pidfds; macOS/BSD use the strongest available start identity and
-  immediate revalidation, with claims calibrated to actual enforcement.
+- Linux uses pidfds as stable individual signal handles. Darwin/BSD capture
+  start time and immediately re-read `(pid, start_time)` before each
+  `kill(pid, signal)`; that validation narrows but cannot atomically eliminate
+  the validation-to-`kill` TOCTOU.
 - Lifetime ownership is excluded: processes already reparented before the
   snapshot, continuous fork tracking, cgroups, and registries remain out of
   scope.

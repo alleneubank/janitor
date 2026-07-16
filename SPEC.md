@@ -7,8 +7,10 @@ teardown, while child processes keep running under `launchd` or another
 subreaper.
 
 The solution is a small wrapper. It starts the target command in a new process
-group, watches for owner-death signals, and drains that group with
-`SIGTERM -> grace -> SIGKILL`.
+group, watches for owner-death signals, and by default captures the live
+descendant snapshot before teardown to drain the resulting drain set with
+`SIGTERM -> grace -> SIGKILL`. `--pgroup-only` explicitly limits teardown to
+the original child process group.
 
 ## Domain Model
 
@@ -28,9 +30,13 @@ group, watches for owner-death signals, and drains that group with
 - **Drain set**: the original child process group plus the individually handled
   escaped descendants in the live snapshot. Its liveness governs escalation.
 - **Process identity**: the PID together with platform-specific evidence that
-  the PID still denotes the captured process. Linux uses a pidfd; macOS/BSD use
-  the strongest available start identity and immediate revalidation before PID
-  signaling. The guarantee is limited to the enforcement the platform exposes.
+  the PID still denotes the captured process. On Linux, an open pidfd is a
+  stable kernel reference and is the handle used for each individual signal. On
+  Darwin/BSD, Janitor captures start time and immediately re-reads
+  `(pid, start_time)` before each individual `kill(pid, signal)`; a mismatch is
+  skipped and diagnosed. Darwin/BSD expose an unavoidable validation-to-`kill`
+  TOCTOU: PID reuse after the re-read and before `kill` cannot be atomically
+  excluded without a stable signal handle.
 - **Incomplete discovery**: failure to obtain or validate a complete snapshot.
   It is diagnosed, does not prevent original-group cleanup, and never expands
   the signal target set by guesswork.
@@ -115,11 +121,13 @@ group, watches for owner-death signals, and drains that group with
   signals each identity-verified escaped descendant; it never signals every
   process group represented by the snapshot.
 - **REQ-JANITOR-021**: Before every individual descendant signal, Janitor
-  validates that the target still has the captured identity, so PID reuse cannot
-  redirect a signal to an unrelated process. Linux signals through stable
-  pidfds. macOS/BSD use the strongest available start identity and immediate
-  revalidation, with platform support documented no more strongly than its
-  enforcement.
+  applies the platform's identity procedure. On Linux, it signals through the
+  captured pidfd, a stable process reference, so PID reuse cannot redirect that
+  individual signal. On Darwin/BSD, it captures start time and immediately
+  re-reads `(pid, start_time)` before `kill(pid, signal)`, skipping and
+  diagnosing a mismatch. Darwin/BSD cannot atomically eliminate the
+  validation-to-`kill` TOCTOU, so a reuse after revalidation and before `kill`
+  remains an explicitly documented platform limit.
 - **REQ-JANITOR-022**: Before forced teardown, Janitor performs a bounded
   resweep to narrow the snapshot-to-signal spawn race. A resweep may add only a
   process whose ancestry is proven from a still-matching captured identity.
@@ -184,8 +192,10 @@ group, watches for owner-death signals, and drains that group with
 - Janitor snapshots the live PPID-linked descendant closure before any teardown
   `SIGTERM` unless `--pgroup-only` was selected.
 - Janitor signals only the child process group wholesale. It signals escaped
-  descendants individually only after their captured identities still match;
-  PID reuse must never redirect a signal to an unrelated process.
+  descendants individually only after its platform identity procedure succeeds:
+  Linux signals through the captured pidfd, while Darwin/BSD immediately
+  re-read the captured `(pid, start_time)` before `kill(pid, signal)` and skip
+  a mismatch. Darwin/BSD retain the documented validation-to-`kill` TOCTOU.
 - Discovery failure or an unverifiable descendant never prevents cleanup of the
   original child process group and never broadens the target set by inference.
 - The bounded resweep adds only descendants with a still-proven, live ancestry.
@@ -215,6 +225,9 @@ group, watches for owner-death signals, and drains that group with
   wait mechanism on supported event backends.
 - No recovery guarantee for ancestry already reparented before the teardown
   snapshot; it is not recoverable through a PPID snapshot alone.
+- No claim that Darwin/BSD can atomically bind `kill(pid, signal)` to the
+  captured start-time identity; their validation-to-`kill` TOCTOU is an
+  unavoidable native-platform limit.
 - No Developer ID identity, Apple notarization, Gatekeeper approval, signed
   macOS `.pkg`, or browser/Finder distribution contract.
 - No Windows binary release until the implementation supports Windows process
@@ -261,6 +274,17 @@ group, watches for owner-death signals, and drains that group with
       targets, and bounded resweep admits only proven live descendants.
 - [ ] Native platform verification covers every platform that advertises
       snapshot descendant draining.
+
+## Risk Classification
+
+- **HIGH — widened process-signal authority and public CLI/default behavior:**
+  REQ-JANITOR-017 through REQ-JANITOR-024 make descendant-aware teardown the
+  default, add the public `--pgroup-only` opt-out, and authorize individual
+  process signals outside the original child process group. Signal safety and
+  the documented platform limits are implementation gates.
+- **PLAN gate:** The active implementation plan is `.rl/task.md`, ratified by
+  the user. Its Phase 1 contract and quality-floor gate governs this HIGH-risk
+  change before runtime implementation proceeds.
 
 ## Test Traceability
 
