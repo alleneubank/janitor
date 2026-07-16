@@ -37,12 +37,13 @@ the original child process group.
   record for liveness and `pidfd_send_signal`; a pidfd opened after an unbound
   numeric snapshot is not identity evidence. If the process exits or its PID is
   recycled between enumeration and stable-handle acquisition, Janitor rejects
-  the record rather than accepting a replacement. On Darwin/BSD, Janitor
-  captures start time and immediately re-reads
+  the record rather than accepting a replacement. On macOS, Janitor captures
+  start time and immediately re-reads
   `(pid, start_time)` before each individual `kill(pid, signal)`; a mismatch is
-  skipped and diagnosed. Darwin/BSD expose an unavoidable validation-to-`kill`
+  skipped and diagnosed. macOS exposes an unavoidable validation-to-`kill`
   TOCTOU: PID reuse after the re-read and before `kill` cannot be atomically
-  excluded without a stable signal handle.
+  excluded without a stable signal handle. Other BSD platforms retain
+  process-group-only teardown and do not advertise descendant draining.
 - **Incomplete discovery**: failure to obtain or validate a complete snapshot.
   It is diagnosed, does not prevent original-group cleanup, and never expands
   the signal target set by guesswork.
@@ -134,11 +135,12 @@ the original child process group.
   unbound numeric `/proc/<pid>/stat` snapshot does not satisfy this requirement.
   A record is rejected and diagnosed when the process exits or its PID is
   recycled between numeric enumeration and stable-handle acquisition. On
-  Darwin/BSD, Janitor captures start time and immediately re-reads
+  macOS, Janitor captures start time and immediately re-reads
   `(pid, start_time)` before `kill(pid, signal)`, skipping and diagnosing a
-  mismatch. Darwin/BSD cannot atomically eliminate the validation-to-`kill`
+  mismatch. macOS cannot atomically eliminate the validation-to-`kill`
   TOCTOU, so a reuse after revalidation and before `kill` remains an explicitly
-  documented platform limit.
+  documented platform limit. Other BSD platforms retain process-group-only
+  teardown and do not advertise descendant draining.
 - **REQ-JANITOR-022**: Before forced teardown, Janitor performs a bounded
   resweep to narrow the snapshot-to-signal spawn race. A resweep may add only a
   process whose ancestry is proven from a still-matching captured identity.
@@ -206,10 +208,11 @@ the original child process group.
   descendants individually only after its platform identity procedure succeeds:
   Linux binds the ancestry-proving PPID, start-time, and PGID process-table
   record to the stable handle used for liveness and `pidfd_send_signal`; a
-  pidfd acquired after an unbound numeric record is rejected. Darwin/BSD
+  pidfd acquired after an unbound numeric record is rejected. macOS
   immediately re-read the captured `(pid, start_time)` before `kill(pid,
-  signal)` and skip a mismatch. Darwin/BSD retain the documented
-  validation-to-`kill` TOCTOU.
+  signal)` and skip a mismatch. macOS retains the documented
+  validation-to-`kill` TOCTOU; other BSD platforms retain process-group-only
+  teardown.
 - Discovery failure or an unverifiable descendant never prevents cleanup of the
   original child process group and never broadens the target set by inference.
 - The bounded resweep adds only descendants with a still-proven, live ancestry.
@@ -357,5 +360,11 @@ the original child process group.
   incomplete/capture-failure diagnostics, and `stale descendant identity from
   completed discovery is diagnosed`, which captures the stale-identity
   diagnostic from the production reporter.
-- REQ-JANITOR-026: `src/root.zig` explicit unsupported-platform diagnostic and
-  `nix develop -c zig build -Dtarget=x86_64-linux` supported-target build.
+- REQ-JANITOR-026: `src/root.zig` `discovery plan executes original-group
+  cleanup and reports limitations` proves that unavailable discovery reports a
+  limitation while retaining group cleanup; `README.md` documents that Linux
+  and macOS are the only advertised snapshot-drain platforms and that other
+  BSD platforms remain group-only. `nix develop -c zig build
+  -Dtarget=x86_64-linux` type-checks the supported Linux implementation. No
+  native BSD snapshot-drain verifier exists because BSD is deliberately not an
+  advertised descendant-drain platform.

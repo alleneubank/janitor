@@ -98,10 +98,15 @@ group.
   target, use `EVFILT_PROC` / `NOTE_EXIT` on macOS/BSD and `pidfd` on Linux.
 - Windows is not supported.
 
+Snapshot descendant draining is supported on Linux and macOS. Other BSD
+platforms retain the original process-group-only teardown: Janitor reports that
+the descendant snapshot is unavailable and never guesses individual targets.
+
 The child command is started in a new process group. Janitor signals only that
 group wholesale; escaped descendants are individually addressed through their
-captured identity. Unsupported descendant-discovery backends diagnose the
-limitation and retain group-only teardown rather than guessing at targets.
+captured identity. Unsupported descendant-discovery backends, including BSD
+platforms other than macOS, diagnose the limitation and retain group-only
+teardown rather than guessing at targets.
 
 ## Claude Code plugin
 
