@@ -300,8 +300,8 @@ the original child process group.
       the original group still drains.
 - [ ] Incomplete discovery is diagnosed without broadening individual signal
       targets, and bounded resweep admits only proven live descendants.
-- [ ] Native platform verification covers every platform that advertises
-      snapshot descendant draining.
+- [ ] Acceptance evidence includes the unit and e2e suites executed natively
+      on each advertised snapshot descendant-drain platform: macOS and Linux.
 
 ## Risk Classification
 

@@ -315,6 +315,31 @@ const DiscoveryPlan = struct {
     diagnostic: ?TeardownDiagnostic = null,
 };
 
+/// A numeric PGID becomes unsafe to signal once its original group has been
+/// observed gone: the kernel may recycle it. The latch makes that observation
+/// monotonic across TERM, grace-period probes, and KILL escalation.
+const DrainSignalAction = struct {
+    signal_original_group: bool,
+    signal_escaped_targets: bool,
+    original_group_dead: bool,
+};
+
+/// Decides the exact production signal set from an immediate group-liveness
+/// observation. Individual capabilities remain safe after the original group
+/// exits, but the numeric PGID does not.
+fn drainSignalAction(
+    plan: DiscoveryPlan,
+    original_group_alive: bool,
+    original_group_dead: bool,
+) DrainSignalAction {
+    const dead = original_group_dead or !original_group_alive;
+    return .{
+        .signal_original_group = plan.signal_original_group and !dead,
+        .signal_escaped_targets = true,
+        .original_group_dead = dead,
+    };
+}
+
 fn discoveryPlan(result: DiscoveryResult) DiscoveryPlan {
     return switch (result) {
         .complete => .{},
@@ -411,6 +436,7 @@ const DrainSet = struct {
     escaped: std.ArrayList(*process_tree.CapturedTarget) = .empty,
     child_pgid: posix.pid_t,
     plan: DiscoveryPlan = .{},
+    original_group_dead: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -464,14 +490,34 @@ const DrainSet = struct {
         if (discovered.incomplete) {
             std.log.warn("descendant resweep could not prove every ancestry link", .{});
         }
-        for (discovered.records) |record| {
-            if (!record.isEscaped(self.child_pgid)) continue;
-            const target = findTargetByIdentity(snapshot.targets, record.identity) orelse continue;
-            try appendUniqueTarget(allocator, &self.escaped, target);
-        }
+        try appendResweptTargets(
+            allocator,
+            &self.escaped,
+            snapshot.targets,
+            discovered.records,
+            self.child_pgid,
+        );
         self.reswept = snapshot;
     }
 };
+
+/// Resweep targets remain owned by `snapshot` until the entire publication is
+/// guaranteed infallible. This prevents an allocation failure from leaving
+/// `escaped` with pointers into a snapshot its errdefer will destroy.
+fn appendResweptTargets(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(*process_tree.CapturedTarget),
+    snapshot_targets: []const *process_tree.CapturedTarget,
+    records: []const process_tree.ProcessRecord,
+    child_pgid: posix.pid_t,
+) !void {
+    try escaped.ensureTotalCapacity(allocator, escaped.items.len + records.len);
+    for (records) |record| {
+        if (!record.isEscaped(child_pgid)) continue;
+        const target = findTargetByIdentity(snapshot_targets, record.identity) orelse continue;
+        appendUniqueTargetAssumeCapacity(escaped, target);
+    }
+}
 
 fn appendEscapedClosure(
     allocator: std.mem.Allocator,
@@ -531,22 +577,42 @@ fn appendUniqueTarget(
     try targets.append(allocator, target);
 }
 
+fn appendUniqueTargetAssumeCapacity(
+    targets: *std.ArrayList(*process_tree.CapturedTarget),
+    target: *process_tree.CapturedTarget,
+) void {
+    for (targets.items) |known| if (known.record().identity.eql(target.record().identity)) return;
+    targets.appendAssumeCapacity(target);
+}
+
 fn signalDrainSet(
-    drain_set: *const DrainSet,
+    drain_set: *DrainSet,
     child_pgid: posix.pid_t,
     signal: u8,
     diagnostics: *std.Io.Writer,
 ) void {
-    // This remains the existing group fast path; escaped descendants are never
-    // promoted into a group signal target.
-    executeDiscoveryPlan(drain_set.plan, child_pgid, signal, signalProcessGroup);
-    for (drain_set.escaped.items) |target| {
-        reportTargetDecision(diagnostics, targetDecision(target.signal(signal)), "individual signal");
+    const action = drainSignalAction(
+        drain_set.plan,
+        isProcessGroupAlive(child_pgid),
+        drain_set.original_group_dead,
+    );
+    drain_set.original_group_dead = action.original_group_dead;
+    if (action.signal_original_group) {
+        // This remains the original group's fast path; escaped descendants are
+        // never promoted into a group target.
+        executeDiscoveryPlan(drain_set.plan, child_pgid, signal, signalProcessGroup);
+    }
+    if (action.signal_escaped_targets) {
+        for (drain_set.escaped.items) |target| {
+            reportTargetDecision(diagnostics, targetDecision(target.signal(signal)), "individual signal");
+        }
     }
 }
 
-fn drainSetAlive(drain_set: *const DrainSet, child_pgid: posix.pid_t, diagnostics: *std.Io.Writer) bool {
-    if (isProcessGroupAlive(child_pgid)) return true;
+fn drainSetAlive(drain_set: *DrainSet, child_pgid: posix.pid_t, diagnostics: *std.Io.Writer) bool {
+    const group_alive = isProcessGroupAlive(child_pgid);
+    drain_set.original_group_dead = drain_set.original_group_dead or !group_alive;
+    if (group_alive and !drain_set.original_group_dead) return true;
     for (drain_set.escaped.items) |target| {
         switch (targetDecision(target.liveness())) {
             .live => return true,
@@ -1189,6 +1255,66 @@ test "discovery plan executes original-group cleanup and reports limitations" {
         reportDiscoveryPlan(&writer, plan, case.detail);
         try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), case.condition) != null);
     }
+}
+
+test "drain signal action latches a dead group while retaining escaped targets" {
+    const plan = discoveryPlan(.complete);
+
+    const dead_group = drainSignalAction(plan, false, false);
+    try std.testing.expect(!dead_group.signal_original_group);
+    try std.testing.expect(dead_group.signal_escaped_targets);
+    try std.testing.expect(dead_group.original_group_dead);
+
+    const later_round = drainSignalAction(plan, true, dead_group.original_group_dead);
+    try std.testing.expect(!later_round.signal_original_group);
+    try std.testing.expect(later_round.signal_escaped_targets);
+    try std.testing.expect(later_round.original_group_dead);
+
+    const live_group = drainSignalAction(plan, true, false);
+    try std.testing.expect(live_group.signal_original_group);
+    try std.testing.expect(live_group.signal_escaped_targets);
+    try std.testing.expect(!live_group.original_group_dead);
+}
+
+test "resweep publication allocation failure leaves drain set valid" {
+    if (!process_tree.descendants_supported) return error.SkipZigTest;
+
+    var snapshot = try process_tree.captureAll(std.testing.allocator);
+    if (snapshot.targets.len == 0) {
+        snapshot.deinit(std.testing.allocator);
+        return error.SkipZigTest;
+    }
+    const target = snapshot.targets[0];
+    const records = [_]process_tree.ProcessRecord{target.record()};
+    var drain_set: DrainSet = .{
+        .initial = snapshot,
+        .child_pgid = 0,
+        .original_group_dead = true,
+    };
+    defer drain_set.deinit(std.testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        appendResweptTargets(
+            failing_allocator.allocator(),
+            &drain_set.escaped,
+            drain_set.initial.?.targets,
+            &records,
+            drain_set.child_pgid,
+        ),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), drain_set.escaped.items.len);
+
+    // With no published snapshot-owned pointers, the same decision seam that
+    // drives signaling still excludes the recycled numeric group and preserves
+    // the individually-addressable escalation path.
+    const action = drainSignalAction(drain_set.plan, false, drain_set.original_group_dead);
+    try std.testing.expect(!action.signal_original_group);
+    try std.testing.expect(action.signal_escaped_targets);
 }
 
 test "stale descendant identity from completed discovery is diagnosed" {
