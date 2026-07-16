@@ -58,7 +58,7 @@ pub fn descendantClosure(
     errdefer selected.deinit(allocator);
 
     var incomplete = tableHasAmbiguityOrMissingParent(table);
-    const root_index = uniqueIndexForPid(table, root.pid, &incomplete) orelse {
+    const root_index = uniqueExactIndexForPid(table, root.pid, &incomplete) orelse {
         return .{ .records = try selected.toOwnedSlice(allocator), .incomplete = true };
     };
     if (!table[root_index].identity.eql(root)) {
@@ -72,9 +72,9 @@ pub fn descendantClosure(
         for (table) |candidate| {
             if (candidate.ppid != parent.identity.pid) continue;
 
-            // A duplicate PID cannot prove a unique ancestry link.  Mark the
-            // snapshot incomplete even when the duplicate is otherwise idle.
-            if (uniqueIndexForPid(table, candidate.identity.pid, &incomplete) == null) continue;
+            // Conflicting duplicate rows cannot prove a unique ancestry link.
+            // Exact duplicates are collapsed by uniqueExactIndexForPid.
+            if (uniqueExactIndexForPid(table, candidate.identity.pid, &incomplete) == null) continue;
             if (containsIdentity(selected.items, candidate.identity)) continue;
 
             // The table is immutable for the pure model, so a PPID link to an
@@ -97,27 +97,38 @@ pub fn resweepDescendants(
     errdefer selected.deinit(allocator);
 
     var incomplete = tableHasAmbiguityOrMissingParent(resweep_table);
-    // A captured closure is root-first.  Starting from that exact root makes a
-    // surviving child insufficient when the root PID itself was recycled.
+    // Every still-present captured identity is a possible safe anchor. A
+    // stale root must not prevent a separately captured, still-live child
+    // from anchoring its own new descendants; conversely, a recycled captured
+    // PID is never allowed to bridge into the replacement's subtree.
     if (captured.len == 0) {
         return .{ .records = try selected.toOwnedSlice(allocator), .incomplete = false };
     }
-    const root = captured[0];
-    const root_index = uniqueIndexForPid(resweep_table, root.identity.pid, &incomplete) orelse {
-        return .{ .records = try selected.toOwnedSlice(allocator), .incomplete = true };
-    };
-    const current_root = resweep_table[root_index];
-    if (!current_root.identity.eql(root.identity)) {
-        return .{ .records = try selected.toOwnedSlice(allocator), .incomplete = true };
+
+    for (captured) |anchor| {
+        const captured_index = uniqueExactIndexForPid(captured, anchor.identity.pid, &incomplete) orelse continue;
+        const expected = captured[captured_index];
+        const index = uniqueExactIndexForPid(resweep_table, expected.identity.pid, &incomplete) orelse continue;
+        const current = resweep_table[index];
+        if (!current.identity.eql(expected.identity)) {
+            incomplete = true;
+            continue;
+        }
+        try appendUnique(allocator, &selected, current);
     }
-    try selected.append(allocator, current_root);
 
     var cursor: usize = 0;
     while (cursor < selected.items.len) : (cursor += 1) {
         const parent = selected.items[cursor];
         for (resweep_table) |candidate| {
             if (candidate.ppid != parent.identity.pid) continue;
-            if (uniqueIndexForPid(resweep_table, candidate.identity.pid, &incomplete) == null) continue;
+            if (uniqueExactIndexForPid(resweep_table, candidate.identity.pid, &incomplete) == null) continue;
+            if (capturedRecordForPid(captured, candidate.identity.pid, &incomplete)) |captured_record| {
+                if (!candidate.identity.eql(captured_record.identity)) {
+                    incomplete = true;
+                    continue;
+                }
+            }
             try appendUnique(allocator, &selected, candidate);
         }
     }
@@ -125,28 +136,47 @@ pub fn resweepDescendants(
     return .{ .records = try selected.toOwnedSlice(allocator), .incomplete = incomplete };
 }
 
-fn uniqueIndexForPid(table: []const ProcessRecord, pid: posix.pid_t, incomplete: *bool) ?usize {
+fn capturedRecordForPid(
+    captured: []const ProcessRecord,
+    pid: posix.pid_t,
+    incomplete: *bool,
+) ?ProcessRecord {
+    const index = uniqueExactIndexForPid(captured, pid, incomplete) orelse return null;
+    return captured[index];
+}
+
+/// Returns one row for a PID when every duplicate is byte-for-byte equivalent.
+/// Exact duplicate proc rows are harmless enumeration repetition; conflicting
+/// rows are ambiguous and can never supply an ancestry bridge.
+fn uniqueExactIndexForPid(table: []const ProcessRecord, pid: posix.pid_t, incomplete: *bool) ?usize {
     var found: ?usize = null;
     for (table, 0..) |item, index| {
         if (item.identity.pid != pid) continue;
-        if (found != null) {
-            incomplete.* = true;
-            return null;
+        if (found) |first| {
+            if (!recordEql(table[first], item)) {
+                incomplete.* = true;
+                return null;
+            }
+            continue;
         }
         found = index;
     }
     return found;
 }
 
+fn recordEql(left: ProcessRecord, right: ProcessRecord) bool {
+    return left.identity.eql(right.identity) and left.ppid == right.ppid and left.pgid == right.pgid;
+}
+
 fn tableHasAmbiguityOrMissingParent(table: []const ProcessRecord) bool {
     var incomplete = false;
     for (table) |item| {
-        if (item.ppid > 0 and uniqueIndexForPid(table, item.ppid, &incomplete) == null) {
+        if (item.ppid > 0 and uniqueExactIndexForPid(table, item.ppid, &incomplete) == null) {
             incomplete = true;
         }
         // Check this PID as well, including rows unrelated to the requested
         // root. A partial/ambiguous global table must not be called complete.
-        _ = uniqueIndexForPid(table, item.identity.pid, &incomplete);
+        _ = uniqueExactIndexForPid(table, item.identity.pid, &incomplete);
     }
     return incomplete;
 }
@@ -167,54 +197,93 @@ fn appendUnique(
 /// A retained, platform-specific authorization to act on `record.identity`.
 /// This is deliberately private-state: callers can construct neither a Linux
 /// signal capability nor an identity-only Darwin target from a PID alone.
-pub const CapturedTarget = struct {
-    record: ProcessRecord,
-    handle: Handle,
+/// Result from a liveness probe or individual signal request. Callers must
+/// keep failures distinct: only `.gone` and `.stale` mean that a target no
+/// longer belongs in a drain set.
+pub const TargetResult = union(enum) {
+    live,
+    signaled,
+    gone,
+    stale,
+    permission_denied,
+    invalid_handle,
+    invalid_request,
+    unsupported,
+    unexpected_errno: posix.E,
+};
 
-    const Handle = union(enum) {
-        linux_proc_fd: posix.fd_t,
-        darwin_revalidate,
-        inert,
-    };
-
-    pub fn deinit(self: *CapturedTarget) void {
-        switch (self.handle) {
-            .linux_proc_fd => |fd| posix.close(fd),
-            .darwin_revalidate, .inert => {},
-        }
-        self.* = undefined;
+/// An opaque, snapshot-owned authorization to act on one captured identity.
+/// Its representation is deliberately unavailable to callers: a PID or
+/// `ProcessIdentity` can inspect a target but can never manufacture, retarget,
+/// copy, or select its platform signaling handle.
+pub const CapturedTarget = opaque {
+    pub fn record(self: *const CapturedTarget) ProcessRecord {
+        return targetImplConst(self).record;
     }
 
-    /// Signal 0 liveness is identity-safe on Linux. Darwin re-reads identity
-    /// immediately before its liveness claim; a reuse after that re-read is the
-    /// documented, unavoidable validation-to-kill TOCTOU.
-    pub fn isLive(self: *const CapturedTarget) bool {
-        return switch (self.handle) {
-            .linux_proc_fd => |fd| linuxSendSignal(fd, 0),
-            .darwin_revalidate => identityStillPresent(self.record.identity),
-            .inert => false,
+    /// A signal-zero probe. Darwin revalidates identity before probing; a
+    /// reuse after that re-read is the documented validation-to-kill TOCTOU.
+    pub fn liveness(self: *const CapturedTarget) TargetResult {
+        const target = targetImplConst(self);
+        return switch (target.handle) {
+            .linux_pidfd => |fd| linuxSignalResult(fd, 0),
+            .darwin_revalidate => darwinSignalResult(target.record.identity, 0, .live),
         };
     }
 
     /// Sends an individual signal only through this captured authorization.
-    pub fn signal(self: *const CapturedTarget, signal_number: u8) bool {
-        return switch (self.handle) {
-            .linux_proc_fd => |fd| linuxSendSignal(fd, signal_number),
-            .darwin_revalidate => if (identityStillPresent(self.record.identity)) blk: {
-                posix.kill(self.record.identity.pid, signal_number) catch break :blk false;
-                break :blk true;
-            } else false,
-            .inert => false,
+    pub fn signal(self: *const CapturedTarget, signal_number: u8) TargetResult {
+        const target = targetImplConst(self);
+        return switch (target.handle) {
+            .linux_pidfd => |fd| linuxSignalResult(fd, signal_number),
+            .darwin_revalidate => darwinSignalResult(target.record.identity, signal_number, .signaled),
         };
     }
 };
 
+const TargetImpl = struct {
+    record: ProcessRecord,
+    handle: Handle,
+
+    const Handle = union(enum) {
+        linux_pidfd: posix.fd_t,
+        darwin_revalidate,
+    };
+};
+
+fn targetImplConst(target: *const CapturedTarget) *const TargetImpl {
+    return @ptrCast(@alignCast(target));
+}
+
+fn targetImpl(target: *CapturedTarget) *TargetImpl {
+    return @ptrCast(@alignCast(target));
+}
+
+fn allocateTarget(
+    allocator: std.mem.Allocator,
+    record: ProcessRecord,
+    handle: TargetImpl.Handle,
+) std.mem.Allocator.Error!*CapturedTarget {
+    const target = try allocator.create(TargetImpl);
+    target.* = .{ .record = record, .handle = handle };
+    return @ptrCast(target);
+}
+
+fn deinitTarget(allocator: std.mem.Allocator, target: *CapturedTarget) void {
+    const implementation = targetImpl(target);
+    switch (implementation.handle) {
+        .linux_pidfd => |fd| posix.close(fd),
+        .darwin_revalidate => {},
+    }
+    allocator.destroy(implementation);
+}
+
 pub const Snapshot = struct {
-    targets: []CapturedTarget,
+    targets: []*CapturedTarget,
     incomplete: bool,
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
-        for (self.targets) |*target| target.deinit();
+        for (self.targets) |target| deinitTarget(allocator, target);
         allocator.free(self.targets);
         self.* = undefined;
     }
@@ -240,9 +309,11 @@ pub fn captureIdentity(pid: posix.pid_t) ?ProcessIdentity {
     };
 }
 
-pub fn identityStillPresent(identity: ProcessIdentity) bool {
-    const current = captureIdentity(identity.pid) orelse return false;
-    return current.eql(identity);
+/// The Linux acquisition boundary accepts only a record observed through the
+/// stable handle when it still exactly matches the enumeration lead. Keeping
+/// this production predicate pure makes the PID-reuse race directly testable.
+fn acceptHandleBoundRecord(lead: ProcessRecord, handle_bound: ProcessRecord) ?ProcessRecord {
+    return if (recordEql(lead, handle_bound)) handle_bound else null;
 }
 
 /// Parses Linux `/proc/<pid>/stat`, treating `comm` as opaque. The terminal
@@ -275,9 +346,9 @@ pub fn parseLinuxStat(input: []const u8) ?ProcessRecord {
 
 fn captureLinux(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator.Error)!Snapshot {
     if (comptime builtin.os.tag != .linux) unreachable;
-    var targets = std.ArrayList(CapturedTarget).empty;
+    var targets = std.ArrayList(*CapturedTarget).empty;
     errdefer {
-        for (targets.items) |*target| target.deinit();
+        for (targets.items) |target| deinitTarget(allocator, target);
         targets.deinit(allocator);
     }
     var incomplete = false;
@@ -294,10 +365,11 @@ fn captureLinux(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator
         if (entry.kind != .directory) continue;
         const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
         if (pid <= 0) continue;
-        const target = captureLinuxTarget(proc, entry.name) orelse {
+        const target = try captureLinuxTarget(allocator, proc, entry.name) orelse {
             incomplete = true;
             continue;
         };
+        errdefer deinitTarget(allocator, target);
         try targets.append(allocator, target);
     }
     return .{ .targets = try targets.toOwnedSlice(allocator), .incomplete = incomplete };
@@ -314,12 +386,41 @@ fn captureLinuxOne(pid: posix.pid_t) ?ProcessIdentity {
     return item.identity;
 }
 
-fn captureLinuxTarget(proc: std.fs.Dir, name: []const u8) ?CapturedTarget {
+fn captureLinuxTarget(
+    allocator: std.mem.Allocator,
+    proc: std.fs.Dir,
+    name: []const u8,
+) std.mem.Allocator.Error!?*CapturedTarget {
     if (comptime builtin.os.tag != .linux) return null;
     var process = proc.openDir(name, .{}) catch return null;
-    errdefer process.close();
-    const item = readLinuxStat(process) orelse return null;
-    return .{ .record = item, .handle = .{ .linux_proc_fd = process.fd } };
+    defer process.close();
+    const lead = readLinuxStat(process) orelse return null;
+    const pidfd = openLinuxPidfd(lead.identity.pid) orelse return null;
+    errdefer posix.close(pidfd);
+    const current = readLinuxRecordByPid(lead.identity.pid) orelse return null;
+    const record = acceptHandleBoundRecord(lead, current) orelse return null;
+    return allocateTarget(allocator, record, .{ .linux_pidfd = pidfd });
+}
+
+/// Opens a pidfd only after the initial record was read through an already
+/// acquired `/proc/<pid>` directory. A second numeric read after pidfd_open
+/// must match that record, proving the pidfd cannot authorize a recycled PID.
+fn openLinuxPidfd(pid: posix.pid_t) ?posix.fd_t {
+    if (comptime builtin.os.tag != .linux) return null;
+    const result = std.os.linux.pidfd_open(pid, 0);
+    return switch (posix.errno(result)) {
+        .SUCCESS => @intCast(result),
+        else => null,
+    };
+}
+
+fn readLinuxRecordByPid(pid: posix.pid_t) ?ProcessRecord {
+    if (comptime builtin.os.tag != .linux) return null;
+    var name: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&name, "/proc/{d}", .{pid}) catch return null;
+    var process = std.fs.openDirAbsolute(path, .{}) catch return null;
+    defer process.close();
+    return readLinuxStat(process);
 }
 
 fn readLinuxStat(process: std.fs.Dir) ?ProcessRecord {
@@ -331,10 +432,21 @@ fn readLinuxStat(process: std.fs.Dir) ?ProcessRecord {
     return parseLinuxStat(buffer[0..bytes]);
 }
 
-fn linuxSendSignal(fd: posix.fd_t, signal: u8) bool {
-    if (comptime builtin.os.tag != .linux) return false;
-    const result = std.os.linux.pidfd_send_signal(fd, @intCast(signal), null, 0);
-    return posix.errno(result) == .SUCCESS;
+fn linuxSignalResult(fd: posix.fd_t, signal: u8) TargetResult {
+    if (comptime builtin.os.tag != .linux) return .unsupported;
+    return signalResultFromErrno(posix.errno(std.os.linux.pidfd_send_signal(fd, @intCast(signal), null, 0)), signal);
+}
+
+fn signalResultFromErrno(errno_code: posix.E, signal: u8) TargetResult {
+    return switch (errno_code) {
+        .SUCCESS => if (signal == 0) .live else .signaled,
+        .SRCH => .gone,
+        .PERM, .ACCES => .permission_denied,
+        .BADF => .invalid_handle,
+        .INVAL => .invalid_request,
+        .NOSYS => .unsupported,
+        else => .{ .unexpected_errno = errno_code },
+    };
 }
 
 const ProcBsdInfo = extern struct {
@@ -375,25 +487,67 @@ const proc_pidtbsdinfo = 3;
 
 fn captureDarwin(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator.Error)!Snapshot {
     if (comptime builtin.os.tag != .macos) unreachable;
-    const byte_count = proc_listallpids(null, 0);
-    if (byte_count <= 0) return error.SnapshotSetupFailed;
-    const count: usize = @intCast(@divTrunc(byte_count, @sizeOf(c_int)));
-    const pids = try allocator.alloc(c_int, count);
+    // libproc returns a PID *count*, while accepting a byte capacity. Leave
+    // bounded slack and retry on a full buffer so a growing table is marked
+    // incomplete rather than silently truncated.
+    const initial_count = proc_listallpids(null, 0);
+    if (initial_count <= 0) return error.SnapshotSetupFailed;
+    var capacity = std.math.add(usize, @intCast(initial_count), 64) catch return error.SnapshotSetupFailed;
+    var pids: []c_int = undefined;
+    var actual_count: usize = 0;
+    var incomplete = false;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        pids = try allocator.alloc(c_int, capacity);
+        const byte_capacity = std.math.mul(usize, capacity, @sizeOf(c_int)) catch {
+            allocator.free(pids);
+            return error.SnapshotSetupFailed;
+        };
+        const result = proc_listallpids(@ptrCast(pids.ptr), std.math.cast(c_int, byte_capacity) orelse {
+            allocator.free(pids);
+            return error.SnapshotSetupFailed;
+        });
+        if (result < 0) {
+            allocator.free(pids);
+            return error.SnapshotSetupFailed;
+        }
+        actual_count = @intCast(result);
+        if (actual_count < capacity) break;
+        allocator.free(pids);
+        if (attempt == 2) {
+            incomplete = true;
+            // We still process every element returned by the final bounded
+            // enumeration, but disclose that a concurrent growth may exist.
+            pids = try allocator.alloc(c_int, capacity);
+            const final_result = proc_listallpids(@ptrCast(pids.ptr), std.math.cast(c_int, byte_capacity) orelse {
+                allocator.free(pids);
+                return error.SnapshotSetupFailed;
+            });
+            if (final_result < 0) {
+                allocator.free(pids);
+                return error.SnapshotSetupFailed;
+            }
+            actual_count = @intCast(final_result);
+            break;
+        }
+        capacity = std.math.add(usize, actual_count, 64) catch return error.SnapshotSetupFailed;
+    }
     defer allocator.free(pids);
-    const actual_bytes = proc_listallpids(@ptrCast(pids.ptr), byte_count);
-    if (actual_bytes < 0) return error.SnapshotSetupFailed;
 
-    var targets = std.ArrayList(CapturedTarget).empty;
-    errdefer targets.deinit(allocator);
-    var incomplete = actual_bytes != byte_count;
-    const actual_count: usize = @intCast(@divTrunc(actual_bytes, @sizeOf(c_int)));
-    for (pids[0..@min(count, actual_count)]) |pid| {
+    var targets = std.ArrayList(*CapturedTarget).empty;
+    errdefer {
+        for (targets.items) |target| deinitTarget(allocator, target);
+        targets.deinit(allocator);
+    }
+    for (pids[0..@min(capacity, actual_count)]) |pid| {
         if (pid <= 0) continue;
         const item = captureDarwinRecord(pid) orelse {
             incomplete = true;
             continue;
         };
-        try targets.append(allocator, .{ .record = item, .handle = .darwin_revalidate });
+        const target = try allocateTarget(allocator, item, .darwin_revalidate);
+        errdefer deinitTarget(allocator, target);
+        try targets.append(allocator, target);
     }
     return .{ .targets = try targets.toOwnedSlice(allocator), .incomplete = incomplete };
 }
@@ -412,6 +566,27 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
         .identity = .{ .pid = pid, .start_token = (@as(u128, info.start_tvsec) << 64) | info.start_tvusec },
         .ppid = @intCast(info.ppid),
         .pgid = @intCast(info.pgid),
+    };
+}
+
+fn darwinSignalResult(identity: ProcessIdentity, signal: u8, success: TargetResult) TargetResult {
+    const current = captureDarwinOne(identity.pid) orelse return darwinAbsentIdentityResult(identity.pid);
+    if (!current.eql(identity)) return .stale;
+    const errno_code = posix.errno(posix.system.kill(identity.pid, signal));
+    return switch (signalResultFromErrno(errno_code, signal)) {
+        .live, .signaled => success,
+        else => |result| result,
+    };
+}
+
+fn darwinAbsentIdentityResult(pid: posix.pid_t) TargetResult {
+    // proc_pidinfo reports several expected OS failures as a short read. A
+    // signal-zero probe recovers the important distinction without granting
+    // signal authorization to a bare PID: this only diagnoses why identity
+    // revalidation could not complete.
+    return switch (signalResultFromErrno(posix.errno(posix.system.kill(pid, 0)), 0)) {
+        .live => .{ .unexpected_errno = .IO },
+        else => |result| result,
     };
 }
 
@@ -459,7 +634,7 @@ test "closure rejects duplicate pid and wrong root identity" {
     try std.testing.expect(mismatch.incomplete);
 }
 
-test "resweep deduplicates deterministically and rejects stale anchors" {
+test "resweep deduplicates exact rows and rejects recycled intermediates" {
     const captured = [_]ProcessRecord{ testRecord(40, 1, 0, 40), testRecord(41, 2, 40, 40) };
     const resweep = [_]ProcessRecord{
         testRecord(40, 1, 0, 40),
@@ -469,15 +644,94 @@ test "resweep deduplicates deterministically and rejects stale anchors" {
     };
     var result = try resweepDescendants(std.testing.allocator, &captured, &resweep);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), result.records.len);
+    try std.testing.expectEqual(@as(usize, 3), result.records.len);
     try std.testing.expectEqual(@as(posix.pid_t, 40), result.records[0].identity.pid);
     try std.testing.expectEqual(@as(posix.pid_t, 41), result.records[1].identity.pid);
-    try std.testing.expect(result.incomplete);
+    try std.testing.expectEqual(@as(posix.pid_t, 42), result.records[2].identity.pid);
+    try std.testing.expect(!result.incomplete);
 
-    const recycled = [_]ProcessRecord{ testRecord(40, 9, 0, 40), testRecord(41, 2, 40, 40), testRecord(42, 3, 41, 77) };
-    var stale = try resweepDescendants(std.testing.allocator, &captured, &recycled);
+    const recycled_intermediate = [_]ProcessRecord{
+        testRecord(40, 1, 0, 40),
+        testRecord(41, 9, 40, 40),
+        testRecord(42, 3, 41, 77),
+    };
+    var stale = try resweepDescendants(std.testing.allocator, &captured, &recycled_intermediate);
     defer stale.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), stale.records.len);
+    try std.testing.expectEqual(@as(usize, 1), stale.records.len);
+    try std.testing.expectEqual(@as(posix.pid_t, 40), stale.records[0].identity.pid);
+    try std.testing.expect(stale.incomplete);
+}
+
+test "resweep permits a surviving non-root anchor and rejects conflicting rows" {
+    const captured = [_]ProcessRecord{ testRecord(50, 1, 0, 50), testRecord(51, 2, 50, 50) };
+    const surviving_child = [_]ProcessRecord{
+        testRecord(50, 9, 0, 50),
+        testRecord(51, 2, 50, 50),
+        testRecord(52, 3, 51, 77),
+    };
+    var expanded = try resweepDescendants(std.testing.allocator, &captured, &surviving_child);
+    defer expanded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), expanded.records.len);
+    try std.testing.expectEqual(@as(posix.pid_t, 51), expanded.records[0].identity.pid);
+    try std.testing.expectEqual(@as(posix.pid_t, 52), expanded.records[1].identity.pid);
+    try std.testing.expect(expanded.incomplete);
+
+    const conflicting = [_]ProcessRecord{
+        testRecord(50, 1, 0, 50),
+        testRecord(51, 2, 50, 50),
+        testRecord(51, 7, 50, 50),
+        testRecord(52, 3, 51, 77),
+    };
+    var ambiguous = try resweepDescendants(std.testing.allocator, &captured, &conflicting);
+    defer ambiguous.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ambiguous.records.len);
+    try std.testing.expectEqual(@as(posix.pid_t, 50), ambiguous.records[0].identity.pid);
+    try std.testing.expect(ambiguous.incomplete);
+}
+
+test "handle-bound acquisition rejects a recycled replacement" {
+    const old_descendant = testRecord(61, 2, 60, 60);
+    const replacement = testRecord(61, 9, 999, 777);
+    try std.testing.expect(acceptHandleBoundRecord(old_descendant, replacement) == null);
+
+    const exact = testRecord(61, 2, 60, 60);
+    const accepted = acceptHandleBoundRecord(old_descendant, exact) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(recordEql(old_descendant, accepted));
+}
+
+test "captured targets are opaque capabilities" {
+    comptime std.debug.assert(@typeInfo(CapturedTarget) == .@"opaque");
+}
+
+test "snapshot owns and releases opaque target allocations" {
+    const target = try allocateTarget(
+        std.testing.allocator,
+        testRecord(70, 1, 0, 70),
+        .darwin_revalidate,
+    );
+    const targets = try std.testing.allocator.alloc(*CapturedTarget, 1);
+    targets[0] = target;
+    var snapshot: Snapshot = .{ .targets = targets, .incomplete = false };
+    snapshot.deinit(std.testing.allocator);
+}
+
+test "signal results preserve disappearance and operational failures" {
+    try std.testing.expect(switch (signalResultFromErrno(.SRCH, 0)) {
+        .gone => true,
+        else => false,
+    });
+    try std.testing.expect(switch (signalResultFromErrno(.PERM, 15)) {
+        .permission_denied => true,
+        else => false,
+    });
+    try std.testing.expect(switch (signalResultFromErrno(.BADF, 15)) {
+        .invalid_handle => true,
+        else => false,
+    });
+    try std.testing.expect(switch (signalResultFromErrno(.NOSYS, 15)) {
+        .unsupported => true,
+        else => false,
+    });
 }
 
 test "linux stat parser survives hostile comm" {
@@ -492,12 +746,19 @@ test "linux stat parser survives hostile comm" {
 test "native current-process identity captures and revalidates on macos" {
     if (builtin.os.tag != .macos) return;
     const identity = captureIdentity(std.c.getpid()) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(identityStillPresent(identity));
+    const current = captureIdentity(identity.pid) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(current.eql(identity));
     var snapshot = try captureAll(std.testing.allocator);
     defer snapshot.deinit(std.testing.allocator);
     var found = false;
     for (snapshot.targets) |target| {
-        if (target.record.identity.eql(identity)) found = true;
+        if (target.record().identity.eql(identity)) found = true;
     }
     try std.testing.expect(found);
+
+    // A fresh count is allowed to race, but a snapshot smaller by the former
+    // count/byte double division (roughly 1/16 coverage) must fail loudly.
+    const fresh_count = proc_listallpids(null, 0);
+    try std.testing.expect(fresh_count > 0);
+    try std.testing.expect(snapshot.targets.len * 4 >= @as(usize, @intCast(fresh_count)));
 }
