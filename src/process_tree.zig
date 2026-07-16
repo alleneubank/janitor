@@ -945,6 +945,15 @@ test "linux stat parser survives hostile comm" {
     try std.testing.expectEqual(@as(u128, 12345), parsed.identity.start_token);
 }
 
+test "linux public captureIdentity path compiles" {
+    // This must be a comptime target branch: the Linux cross-target gate
+    // cannot execute on macOS, but it must still instantiate captureLinuxOne
+    // through the public API to type-check its proc-read error handling.
+    if (comptime builtin.os.tag == .linux) {
+        _ = captureIdentity(std.c.getpid());
+    }
+}
+
 test "native current-process identity captures and revalidates on macos" {
     if (builtin.os.tag != .macos) return;
     const identity = captureIdentity(std.c.getpid()) orelse return error.TestUnexpectedResult;
