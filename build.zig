@@ -66,6 +66,16 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(cc_hook_tests).step);
 
+    // Process discovery has native libc entry points on Darwin and Linux
+    // pidfd syscalls. Keep it independently testable before Phase 4 imports it.
+    const process_tree_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/process_tree.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(process_tree_tests).step);
+
     // Keep plugin distribution checks explicit so ordinary builds still work
     // from a checkout with a temporarily edited manifest.
     const check_plugin_version_exe = b.addExecutable(.{
