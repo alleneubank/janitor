@@ -14,7 +14,26 @@ group, watches for owner-death signals, and drains that group with
 
 - **Janitor**: the `janitor` process.
 - **Original parent**: `janitor`'s parent PID captured before spawning the child.
-- **Child process group**: the process group created for the target command.
+- **Child process group**: the process group created for the target command;
+  the only group Janitor signals wholesale.
+- **Drain mode**: the default `snapshot` mode or the `pgroup-only` opt-out.
+- **Live descendant snapshot**: the PPID-linked closure rooted at the direct
+  child, captured while its ancestry is live and before Janitor sends the first
+  teardown `SIGTERM`. It includes only processes whose captured identity and
+  PPID chain prove that they descend from the direct child at that point.
+- **Escaped descendant**: a member of the live descendant snapshot that is not
+  in the child process group, including one that called `setsid()`. Janitor
+  handles an escaped descendant as an identity-verified individual process,
+  never by signaling its current process group.
+- **Drain set**: the original child process group plus the individually handled
+  escaped descendants in the live snapshot. Its liveness governs escalation.
+- **Process identity**: the PID together with platform-specific evidence that
+  the PID still denotes the captured process. Linux uses a pidfd; macOS/BSD use
+  the strongest available start identity and immediate revalidation before PID
+  signaling. The guarantee is limited to the enforcement the platform exposes.
+- **Incomplete discovery**: failure to obtain or validate a complete snapshot.
+  It is diagnosed, does not prevent original-group cleanup, and never expands
+  the signal target set by guesswork.
 - **Controlling terminal**: the terminal `janitor` inherits on standard input
   when launched interactively; its foreground process group governs keyboard
   input and terminal-generated signal (`Ctrl-C`/`SIGINT`) delivery.
@@ -83,6 +102,38 @@ group, watches for owner-death signals, and drains that group with
   `plugin/.claude-plugin/plugin.json` equals the package version in
   `build.zig.zon`; `zig build check-plugin-version` enforces the two versions
   stay in sync.
+- **REQ-JANITOR-017**: By default, teardown uses snapshot mode: Janitor captures
+  the live PPID-linked descendant closure rooted at the direct child before any
+  teardown `SIGTERM`, then drains the resulting drain set.
+- **REQ-JANITOR-018**: `--pgroup-only` opts out of descendant snapshotting and
+  restores process-group-only teardown.
+- **REQ-JANITOR-019**: Janitor completes the initial live descendant snapshot
+  before signaling `SIGTERM`; descendants already reparented before that point
+  are outside this recovery guarantee.
+- **REQ-JANITOR-020**: Janitor preserves the original child process-group fast
+  path and is the only process group it signals wholesale. It individually
+  signals each identity-verified escaped descendant; it never signals every
+  process group represented by the snapshot.
+- **REQ-JANITOR-021**: Before every individual descendant signal, Janitor
+  validates that the target still has the captured identity, so PID reuse cannot
+  redirect a signal to an unrelated process. Linux signals through stable
+  pidfds. macOS/BSD use the strongest available start identity and immediate
+  revalidation, with platform support documented no more strongly than its
+  enforcement.
+- **REQ-JANITOR-022**: Before forced teardown, Janitor performs a bounded
+  resweep to narrow the snapshot-to-signal spawn race. A resweep may add only a
+  process whose ancestry is proven from a still-matching captured identity.
+- **REQ-JANITOR-023**: Incomplete discovery emits a clear diagnostic and still
+  drains the original child process group. It never blocks that cleanup or
+  broadens the guessed individual signal set.
+- **REQ-JANITOR-024**: Janitor decides TERM-to-KILL escalation from liveness of
+  the full drain set, not only the original child process group or direct child.
+- **REQ-JANITOR-025**: Descendant-aware teardown preserves the direct child's
+  exit status as Janitor's exit-status contract when that status is available.
+- **REQ-JANITOR-026**: Janitor advertises snapshot descendant draining only on
+  platforms where discovery, identity validation, individual signaling, and
+  their native verification meet these requirements; unsupported backends retain
+  no silent partial descendant-drain claim.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, applies a credential-free ad-hoc signature, packages
   README and LICENSE beside the binary, extracts the archive, and verifies the
@@ -130,13 +181,19 @@ group, watches for owner-death signals, and drains that group with
 
 ## Invariants
 
-- `janitor` only signals the process group it created.
+- Janitor snapshots the live PPID-linked descendant closure before any teardown
+  `SIGTERM` unless `--pgroup-only` was selected.
+- Janitor signals only the child process group wholesale. It signals escaped
+  descendants individually only after their captured identities still match;
+  PID reuse must never redirect a signal to an unrelated process.
+- Discovery failure or an unverifiable descendant never prevents cleanup of the
+  original child process group and never broadens the target set by inference.
+- The bounded resweep adds only descendants with a still-proven, live ancestry.
+- Grace and forced-teardown decisions observe the full drain set.
 - `janitor` blocks `SIGTTOU` around `tcsetpgrp` so reclaiming the controlling
   terminal from a background process group cannot stop `janitor`.
-- `janitor` does not try to kill processes that escape into a different session
-  or process group.
 - Cleanup logic is idempotent; `ESRCH` while signaling means the group already
-  drained.
+  or individually verified target already drained.
 - Parent death is detected as `getppid() != original_parent`, not
   `getppid() == 1`.
 - Release automation has no signing or notarization secrets to read, print, or
@@ -148,15 +205,16 @@ group, watches for owner-death signals, and drains that group with
 
 ## Non-Goals
 
-- No daemon, launchd agent, cgroup manager, or persistent process registry.
+- No lifetime ownership, continuous fork tracking, daemon, launchd agent,
+  cgroup manager, or persistent process registry.
 - `janitor` does not allocate a pseudo-terminal or proxy child I/O; it only
   transfers foreground ownership of the controlling terminal it already
   inherited on standard input.
 - No Windows support in this implementation.
 - `--poll-ms` remains accepted for CLI compatibility, but it is not the idle
   wait mechanism on supported event backends.
-- No attempt to recover children that deliberately call `setsid()` without their
-  own nested janitor.
+- No recovery guarantee for ancestry already reparented before the teardown
+  snapshot; it is not recoverable through a PPID snapshot alone.
 - No Developer ID identity, Apple notarization, Gatekeeper approval, signed
   macOS `.pkg`, or browser/Finder distribution contract.
 - No Windows binary release until the implementation supports Windows process
@@ -193,6 +251,16 @@ group, watches for owner-death signals, and drains that group with
       fails open on malformed input.
 - [x] The Claude Code plugin manifest and hooks JSON are valid and register the
       expected hooks.
+- [ ] Default teardown snapshots a live `setsid()` descendant before TERM and
+      drains it with the full drain set.
+- [ ] `--pgroup-only` retains process-group-only teardown and leaves an escaped
+      descendant outside Janitor's drain set.
+- [ ] An identity mismatch or PID-reuse candidate is skipped and diagnosed;
+      the original group still drains.
+- [ ] Incomplete discovery is diagnosed without broadening individual signal
+      targets, and bounded resweep admits only proven live descendants.
+- [ ] Native platform verification covers every platform that advertises
+      snapshot descendant draining.
 
 ## Test Traceability
 
@@ -231,3 +299,13 @@ group, watches for owner-death signals, and drains that group with
   (`janitor cc-hook ... 2>/dev/null || true`).
 - REQ-PLUGIN-007: `src/cc_hook.zig` `resolveClaudePidWalk` and `isShellComm`
   tests.
+- REQ-JANITOR-017, REQ-JANITOR-019, REQ-JANITOR-020, REQ-JANITOR-024,
+  REQ-JANITOR-025: planned compiled-binary `src/e2e.zig` detached-descendant
+  teardown coverage.
+- REQ-JANITOR-018: planned `src/root.zig` CLI parsing coverage and compiled-
+  binary `src/e2e.zig` opt-out coverage.
+- REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023: planned process-tree unit
+  coverage for identity validation, PID reuse, bounded resweep, incomplete
+  discovery, and unrelated-process exclusion.
+- REQ-JANITOR-026: planned native-platform verification and supported-target
+  build coverage.

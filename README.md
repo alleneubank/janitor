@@ -1,7 +1,7 @@
 # janitor
 
-`janitor` runs a command in its own process group and tears that group down when
-its owner goes away.
+`janitor` runs a command in its own process group and drains its live process
+descendants when its owner goes away.
 
 It is meant for development stacks where one layer can die without running a
 clean shutdown: shells, Claude Code sessions, zmx, Tilt, `serve_cmd`, local
@@ -19,8 +19,12 @@ keep ports, files, databases, and CPU alive.
 1. Capture the original parent PID.
 2. Spawn the command as a new process-group leader.
 3. Watch the parent, child, signals, and optional worktree path.
-4. On any death trigger, send `SIGTERM` to the child process group.
-5. Wait for the grace window, then send `SIGKILL` if anything remains.
+4. On any death trigger, snapshot the direct child's live PPID-linked descendant
+   closure before sending any teardown signal.
+5. Send `SIGTERM` to the original child process group and to identity-verified
+   descendants that escaped it.
+6. Wait for the grace window, then send `SIGKILL` if anything in the full drain
+   set remains.
 
 ## Install
 
@@ -53,7 +57,7 @@ JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 ## Usage
 
 ```sh
-janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] -- CMD [ARGS...]
+janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] [--pgroup-only] -- CMD [ARGS...]
 janitor version | --version | -V
 ```
 
@@ -81,6 +85,14 @@ directly is more reliable than relying on `janitor`'s immediate parent.
 supported platforms, the active watcher is event-driven and does not use
 periodic idle polling.
 
+By default, teardown takes a live descendant snapshot before its first TERM.
+The original child process group remains the fast path and the only process
+group signaled wholesale. A descendant that called `setsid()` or otherwise
+escaped that group is signaled individually only when Janitor can revalidate
+the captured process identity; this prevents PID reuse from targeting an
+unrelated process. `--pgroup-only` is the escape hatch for the prior
+process-group-only behavior.
+
 ## Platform Behavior
 
 - macOS and BSD use `kqueue` for process, signal, vnode, and timeout waits.
@@ -89,8 +101,14 @@ periodic idle polling.
   target, use `EVFILT_PROC` / `NOTE_EXIT` on macOS/BSD and `pidfd` on Linux.
 - Windows is not supported.
 
-The child command is started in a new process group. Teardown only signals that
-group, so unrelated processes are not touched.
+The child command is started in a new process group. Teardown signals that
+original group wholesale, then handles proven escaped descendants individually;
+it never signals every process group represented by a snapshot. Linux uses
+pidfds for stable individual-process identity. macOS/BSD use the strongest
+available start identity and immediate revalidation, with support claims limited
+to what the native platform verification enforces. If discovery is incomplete,
+Janitor diagnoses it, still drains the original group, and never guesses at
+additional signal targets.
 
 ## Claude Code plugin
 
@@ -118,8 +136,14 @@ configuration knobs.
 
 ## Limitations
 
-- A descendant that deliberately calls `setsid()` or moves to another process
-  group can escape. Wrap that daemon with its own `janitor` if it self-daemonizes.
+- A descendant already reparented before the teardown snapshot is not
+  recoverable through PPID ancestry and remains out of scope. Janitor is not a
+  lifetime owner: it does not continuously track forks or use cgroups or a
+  persistent process registry.
+- A live `setsid()` descendant is drained by default only when its PPID ancestry
+  and identity can be proven. If either cannot be verified, Janitor skips and
+  diagnoses that individual target rather than risk signaling an unrelated
+  process; `--pgroup-only` intentionally omits all escaped descendants.
 - `SIGKILL` sent directly to `janitor` cannot be handled by any userspace
   wrapper, so cleanup is impossible in that one case.
 - The exit status follows the direct child when available. Signal deaths are
