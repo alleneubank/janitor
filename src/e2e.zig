@@ -124,7 +124,8 @@ fn testWatchPathDrainsDetachedDescendant(
     }
 
     const detached_pid = try waitForPidFile(detached_pid_path, 3000);
-    defer killAndWaitForProcessGone(detached_pid);
+    var detached_cleanup_required = true;
+    defer if (detached_cleanup_required) killAndWaitForProcessGone(detached_pid);
 
     if (!processExists(detached_pid)) {
         std.debug.print("detached fixture pid {d} exited before teardown\n", .{detached_pid});
@@ -139,6 +140,9 @@ fn testWatchPathDrainsDetachedDescendant(
         std.debug.print("detached descendant {d} survived Janitor teardown\n", .{detached_pid});
         return err;
     };
+    // The disappearance assertion makes numeric-PID cleanup unsafe: a later
+    // PID reuse must never let this harness signal an unrelated process.
+    detached_cleanup_required = false;
 }
 
 // REQ-JANITOR-015: `janitor --version`, `-V`, and the `version` subcommand each
