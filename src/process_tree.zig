@@ -226,7 +226,7 @@ pub const CapturedTarget = opaque {
     pub fn liveness(self: *const CapturedTarget) TargetResult {
         const target = targetImplConst(self);
         return switch (target.handle) {
-            .linux_pidfd => |fd| linuxSignalResult(fd, 0),
+            .linux_proc_dir => |fd| linuxSignalResult(fd, 0),
             .darwin_revalidate => darwinSignalResult(target.record.identity, 0, .live),
         };
     }
@@ -235,7 +235,7 @@ pub const CapturedTarget = opaque {
     pub fn signal(self: *const CapturedTarget, signal_number: u8) TargetResult {
         const target = targetImplConst(self);
         return switch (target.handle) {
-            .linux_pidfd => |fd| linuxSignalResult(fd, signal_number),
+            .linux_proc_dir => |fd| linuxSignalResult(fd, signal_number),
             .darwin_revalidate => darwinSignalResult(target.record.identity, signal_number, .signaled),
         };
     }
@@ -246,7 +246,10 @@ const TargetImpl = struct {
     handle: Handle,
 
     const Handle = union(enum) {
-        linux_pidfd: posix.fd_t,
+        // Linux accepts a stable `/proc/<pid>` directory FD in
+        // pidfd_send_signal. Retaining that FD keeps the signal capability
+        // identical to the handle through which this record was observed.
+        linux_proc_dir: posix.fd_t,
         darwin_revalidate,
     };
 };
@@ -272,7 +275,7 @@ fn allocateTarget(
 fn deinitTarget(allocator: std.mem.Allocator, target: *CapturedTarget) void {
     const implementation = targetImpl(target);
     switch (implementation.handle) {
-        .linux_pidfd => |fd| posix.close(fd),
+        .linux_proc_dir => |fd| posix.close(fd),
         .darwin_revalidate => {},
     }
     allocator.destroy(implementation);
@@ -289,7 +292,15 @@ pub const Snapshot = struct {
     }
 };
 
-pub const CaptureError = error{ UnsupportedPlatform, SnapshotSetupFailed };
+const LinuxAcquireError = error{
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    UnsupportedProcHandle,
+    SnapshotSetupFailed,
+};
+
+pub const CaptureError = error{ UnsupportedPlatform, SnapshotSetupFailed } || LinuxAcquireError;
 
 /// Captures every readable process record. Expected disappearance or unreadable
 /// entries only marks the snapshot incomplete; allocation/setup errors escape.
@@ -309,11 +320,52 @@ pub fn captureIdentity(pid: posix.pid_t) ?ProcessIdentity {
     };
 }
 
-/// The Linux acquisition boundary accepts only a record observed through the
-/// stable handle when it still exactly matches the enumeration lead. Keeping
-/// this production predicate pure makes the PID-reuse race directly testable.
-fn acceptHandleBoundRecord(lead: ProcessRecord, handle_bound: ProcessRecord) ?ProcessRecord {
-    return if (recordEql(lead, handle_bound)) handle_bound else null;
+/// `/proc` entry metadata captured before opening the directory. The inode is
+/// compared with `fstat`-equivalent metadata from the retained FD so a numeric
+/// directory name cannot silently hand off to a replacement process.
+const LinuxProcEntryIdentity = struct {
+    inode: u64,
+
+    fn eql(left: LinuxProcEntryIdentity, right: LinuxProcEntryIdentity) bool {
+        return left.inode == right.inode;
+    }
+};
+
+const LinuxEnumerationLead = struct {
+    pid: posix.pid_t,
+    entry_identity: LinuxProcEntryIdentity,
+};
+
+const LinuxTargetAcquisition = union(enum) {
+    target: *CapturedTarget,
+    incomplete,
+};
+
+const LinuxProcHandleReader = struct {
+    directory: std.fs.Dir,
+
+    fn readEntryIdentity(self: *const LinuxProcHandleReader) LinuxAcquireError!?LinuxProcEntryIdentity {
+        return linuxProcEntryIdentityFromFd(self.directory.fd);
+    }
+
+    fn readRecord(self: *const LinuxProcHandleReader) LinuxAcquireError!?ProcessRecord {
+        return readLinuxStat(self.directory);
+    }
+};
+
+/// Reads and validates the target through one acquired proc-directory handle.
+/// This is generic only so the test harness can substitute a faithful stable
+/// handle; production passes `LinuxProcHandleReader` backed by a real FD.
+fn readLinuxHandleRecord(
+    lead: LinuxEnumerationLead,
+    reader: anytype,
+) LinuxAcquireError!?ProcessRecord {
+    const handle_identity = try reader.readEntryIdentity() orelse return null;
+    if (!lead.entry_identity.eql(handle_identity)) return null;
+
+    const record = try reader.readRecord() orelse return null;
+    if (record.identity.pid != lead.pid) return null;
+    return record;
 }
 
 /// Parses Linux `/proc/<pid>/stat`, treating `comm` as opaque. The terminal
@@ -365,12 +417,13 @@ fn captureLinux(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator
         if (entry.kind != .directory) continue;
         const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
         if (pid <= 0) continue;
-        const target = try captureLinuxTarget(allocator, proc, entry.name) orelse {
-            incomplete = true;
-            continue;
-        };
-        errdefer deinitTarget(allocator, target);
-        try targets.append(allocator, target);
+        switch (try captureLinuxTarget(allocator, proc, entry.name, pid)) {
+            .incomplete => incomplete = true,
+            .target => |target| {
+                errdefer deinitTarget(allocator, target);
+                try targets.append(allocator, target);
+            },
+        }
     }
     return .{ .targets = try targets.toOwnedSlice(allocator), .incomplete = incomplete };
 }
@@ -390,46 +443,113 @@ fn captureLinuxTarget(
     allocator: std.mem.Allocator,
     proc: std.fs.Dir,
     name: []const u8,
-) std.mem.Allocator.Error!?*CapturedTarget {
-    if (comptime builtin.os.tag != .linux) return null;
-    var process = proc.openDir(name, .{}) catch return null;
-    defer process.close();
-    const lead = readLinuxStat(process) orelse return null;
-    const pidfd = openLinuxPidfd(lead.identity.pid) orelse return null;
-    errdefer posix.close(pidfd);
-    const current = readLinuxRecordByPid(lead.identity.pid) orelse return null;
-    const record = acceptHandleBoundRecord(lead, current) orelse return null;
-    return allocateTarget(allocator, record, .{ .linux_pidfd = pidfd });
+    pid: posix.pid_t,
+) (LinuxAcquireError || std.mem.Allocator.Error)!LinuxTargetAcquisition {
+    if (comptime builtin.os.tag != .linux) return .incomplete;
+
+    // The numeric directory entry is just a lead. Record its identity before
+    // open, then require the retained FD to denote that same proc entry.
+    const entry_identity = try linuxProcEntryIdentityAt(proc.fd, name) orelse return .incomplete;
+    var process = proc.openDir(name, .{}) catch |err| {
+        _ = try linuxAcquisitionDispositionFromError(err);
+        return .incomplete;
+    };
+    var transferred = false;
+    defer if (!transferred) process.close();
+
+    var reader: LinuxProcHandleReader = .{ .directory = process };
+    const record = try readLinuxHandleRecord(.{
+        .pid = pid,
+        .entry_identity = entry_identity,
+    }, &reader) orelse return .incomplete;
+
+    const target = try allocateTarget(allocator, record, .{ .linux_proc_dir = process.fd });
+    transferred = true;
+    return .{ .target = target };
 }
 
-/// Opens a pidfd only after the initial record was read through an already
-/// acquired `/proc/<pid>` directory. A second numeric read after pidfd_open
-/// must match that record, proving the pidfd cannot authorize a recycled PID.
-fn openLinuxPidfd(pid: posix.pid_t) ?posix.fd_t {
-    if (comptime builtin.os.tag != .linux) return null;
-    const result = std.os.linux.pidfd_open(pid, 0);
-    return switch (posix.errno(result)) {
-        .SUCCESS => @intCast(result),
-        else => null,
+fn linuxProcEntryIdentityAt(
+    proc_fd: posix.fd_t,
+    name: []const u8,
+) LinuxAcquireError!?LinuxProcEntryIdentity {
+    const name_z = posix.toPosixPath(name) catch return error.SnapshotSetupFailed;
+    return linuxProcEntryIdentityFromStatx(proc_fd, &name_z, std.os.linux.AT.NO_AUTOMOUNT);
+}
+
+fn linuxProcEntryIdentityFromFd(fd: posix.fd_t) LinuxAcquireError!?LinuxProcEntryIdentity {
+    return linuxProcEntryIdentityFromStatx(fd, "", std.os.linux.AT.EMPTY_PATH);
+}
+
+fn linuxProcEntryIdentityFromStatx(
+    dir_fd: posix.fd_t,
+    path: [*:0]const u8,
+    flags: u32,
+) LinuxAcquireError!?LinuxProcEntryIdentity {
+    var metadata = std.mem.zeroes(std.os.linux.Statx);
+    const result = std.os.linux.statx(
+        dir_fd,
+        path,
+        flags,
+        std.os.linux.STATX_TYPE | std.os.linux.STATX_INO,
+        &metadata,
+    );
+    switch (posix.errno(result)) {
+        .SUCCESS => {},
+        else => {
+            _ = try linuxAcquisitionDispositionFromErrno(posix.errno(result));
+            return null;
+        },
+    }
+    if ((metadata.mask & std.os.linux.STATX_INO) == 0) return error.UnsupportedProcHandle;
+    if ((metadata.mask & std.os.linux.STATX_TYPE) == 0) return error.UnsupportedProcHandle;
+    if ((metadata.mode & std.os.linux.S.IFMT) != std.os.linux.S.IFDIR) return null;
+    return .{ .inode = metadata.ino };
+}
+
+fn readLinuxStat(process: std.fs.Dir) LinuxAcquireError!?ProcessRecord {
+    var stat = process.openFile("stat", .{}) catch |err| {
+        _ = try linuxAcquisitionDispositionFromError(err);
+        return null;
+    };
+    defer stat.close();
+    var buffer: [4096]u8 = undefined;
+    const bytes = stat.readAll(&buffer) catch |err| {
+        _ = try linuxAcquisitionDispositionFromError(err);
+        return null;
+    };
+    return parseLinuxStat(buffer[0..bytes]);
+}
+
+const LinuxAcquisitionDisposition = enum { incomplete };
+
+/// Expected process disappearance, PID recycling, and permission races leave
+/// a disclosed partial snapshot. Descriptor exhaustion, memory pressure,
+/// unsupported proc semantics, and unknown operating failures must stop
+/// capture instead of being misreported as a successful partial snapshot.
+fn linuxAcquisitionDispositionFromErrno(
+    errno_code: posix.E,
+) LinuxAcquireError!LinuxAcquisitionDisposition {
+    return switch (errno_code) {
+        .NOENT, .SRCH, .ACCES, .PERM, .NOTDIR => .incomplete,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOMEM => error.SystemResources,
+        .NODEV => error.UnsupportedProcHandle,
+        else => error.SnapshotSetupFailed,
     };
 }
 
-fn readLinuxRecordByPid(pid: posix.pid_t) ?ProcessRecord {
-    if (comptime builtin.os.tag != .linux) return null;
-    var name: [32]u8 = undefined;
-    const path = std.fmt.bufPrint(&name, "/proc/{d}", .{pid}) catch return null;
-    var process = std.fs.openDirAbsolute(path, .{}) catch return null;
-    defer process.close();
-    return readLinuxStat(process);
-}
-
-fn readLinuxStat(process: std.fs.Dir) ?ProcessRecord {
-    if (comptime builtin.os.tag != .linux) return null;
-    var stat = process.openFile("stat", .{}) catch return null;
-    defer stat.close();
-    var buffer: [4096]u8 = undefined;
-    const bytes = stat.readAll(&buffer) catch return null;
-    return parseLinuxStat(buffer[0..bytes]);
+fn linuxAcquisitionDispositionFromError(
+    err: anyerror,
+) LinuxAcquireError!LinuxAcquisitionDisposition {
+    return switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.NotDir => .incomplete,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => error.SystemFdQuotaExceeded,
+        error.SystemResources => error.SystemResources,
+        error.NoDevice => error.UnsupportedProcHandle,
+        else => error.SnapshotSetupFailed,
+    };
 }
 
 fn linuxSignalResult(fd: posix.fd_t, signal: u8) TargetResult {
@@ -689,14 +809,87 @@ test "resweep permits a surviving non-root anchor and rejects conflicting rows" 
     try std.testing.expect(ambiguous.incomplete);
 }
 
-test "handle-bound acquisition rejects a recycled replacement" {
-    const old_descendant = testRecord(61, 2, 60, 60);
-    const replacement = testRecord(61, 9, 999, 777);
-    try std.testing.expect(acceptHandleBoundRecord(old_descendant, replacement) == null);
+test "linux handle reader rejects a recycled proc entry and accepts an exact handle" {
+    const FakeStableHandle = struct {
+        const Self = @This();
 
-    const exact = testRecord(61, 2, 60, 60);
-    const accepted = acceptHandleBoundRecord(old_descendant, exact) orelse return error.TestUnexpectedResult;
+        entry_identity: LinuxProcEntryIdentity,
+        record: ProcessRecord,
+
+        fn readEntryIdentity(self: *const Self) LinuxAcquireError!?LinuxProcEntryIdentity {
+            return self.entry_identity;
+        }
+
+        fn readRecord(self: *const Self) LinuxAcquireError!?ProcessRecord {
+            return self.record;
+        }
+    };
+
+    const old_descendant = testRecord(61, 2, 60, 60);
+    const original_entry: LinuxProcEntryIdentity = .{ .inode = 6101 };
+    const replacement_entry: LinuxProcEntryIdentity = .{ .inode = 6102 };
+    var replacement_handle: FakeStableHandle = .{
+        .entry_identity = replacement_entry,
+        .record = testRecord(61, 9, 999, 777),
+    };
+    const rejected = try readLinuxHandleRecord(.{
+        .pid = old_descendant.identity.pid,
+        .entry_identity = original_entry,
+    }, &replacement_handle);
+    try std.testing.expect(rejected == null);
+
+    // A rejected handle read provides no row to the same closure builder that
+    // determines the drain set, so the replacement cannot be selected under
+    // the old descendant's PPID link.
+    const root = testRecord(60, 1, 0, 60);
+    var drain_rows = std.ArrayList(ProcessRecord).empty;
+    defer drain_rows.deinit(std.testing.allocator);
+    try drain_rows.append(std.testing.allocator, root);
+    if (rejected) |record| try drain_rows.append(std.testing.allocator, record);
+    var closure = try descendantClosure(std.testing.allocator, drain_rows.items, root.identity);
+    defer closure.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), closure.records.len);
+
+    var exact_handle: FakeStableHandle = .{
+        .entry_identity = original_entry,
+        .record = old_descendant,
+    };
+    const accepted = try readLinuxHandleRecord(.{
+        .pid = old_descendant.identity.pid,
+        .entry_identity = original_entry,
+    }, &exact_handle) orelse return error.TestUnexpectedResult;
     try std.testing.expect(recordEql(old_descendant, accepted));
+}
+
+test "linux acquisition maps races separately from fatal handle failures" {
+    try std.testing.expectEqual(
+        LinuxAcquisitionDisposition.incomplete,
+        try linuxAcquisitionDispositionFromErrno(.SRCH),
+    );
+    try std.testing.expectEqual(
+        LinuxAcquisitionDisposition.incomplete,
+        try linuxAcquisitionDispositionFromErrno(.ACCES),
+    );
+    try std.testing.expectError(
+        error.ProcessFdQuotaExceeded,
+        linuxAcquisitionDispositionFromErrno(.MFILE),
+    );
+    try std.testing.expectError(
+        error.SystemFdQuotaExceeded,
+        linuxAcquisitionDispositionFromErrno(.NFILE),
+    );
+    try std.testing.expectError(
+        error.SystemResources,
+        linuxAcquisitionDispositionFromErrno(.NOMEM),
+    );
+    try std.testing.expectError(
+        error.UnsupportedProcHandle,
+        linuxAcquisitionDispositionFromErrno(.NODEV),
+    );
+    try std.testing.expectError(
+        error.SnapshotSetupFailed,
+        linuxAcquisitionDispositionFromErrno(.IO),
+    );
 }
 
 test "captured targets are opaque capabilities" {
