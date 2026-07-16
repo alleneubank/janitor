@@ -220,20 +220,48 @@ fn teardown(
     child_state: *ChildState,
     reason: TeardownReason,
 ) u8 {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.fs.File.stderr().writer(&stderr_buffer);
+    defer stderr.interface.flush() catch {};
+
+    return teardownWithDiagnostics(
+        allocator,
+        child_pid,
+        child_pgid,
+        config,
+        watcher,
+        child_state,
+        reason,
+        &stderr.interface,
+    );
+}
+
+fn teardownWithDiagnostics(
+    allocator: std.mem.Allocator,
+    child_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+    config: Config,
+    watcher: *Watcher,
+    child_state: *ChildState,
+    reason: TeardownReason,
+    diagnostics: *std.Io.Writer,
+) u8 {
     _ = reason;
 
     var drain_set = DrainSet.init(allocator, config.drain_scope, child_pid, child_pgid) catch |err| {
-        reportDiscoveryDecision(discoveryDecision(.capture_failed), @errorName(err));
-        return teardownGroupOnly(child_pid, child_pgid, config, watcher, child_state);
+        const plan = discoveryPlan(.capture_failed);
+        reportDiscoveryPlan(diagnostics, plan, @errorName(err));
+        return teardownGroupOnly(plan, child_pid, child_pgid, config, watcher, child_state);
     };
     defer drain_set.deinit(allocator);
 
-    signalDrainSet(&drain_set, child_pgid, posix.SIG.TERM);
+    reportDiscoveryPlan(diagnostics, drain_set.plan, null);
+    signalDrainSet(&drain_set, child_pgid, posix.SIG.TERM, diagnostics);
 
     const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
     while (monotonicNowNs() < deadline_ns) {
         _ = tryPollChild(child_pid, child_state);
-        if (!drainSetAlive(&drain_set, child_pgid)) break;
+        if (!drainSetAlive(&drain_set, child_pgid, diagnostics)) break;
 
         const remaining_ms = remainingMs(deadline_ns);
         if (remaining_ms == 0) break;
@@ -241,14 +269,14 @@ fn teardown(
         if (event == .timeout) break;
     }
 
-    if (drainSetAlive(&drain_set, child_pgid)) {
+    if (drainSetAlive(&drain_set, child_pgid, diagnostics)) {
         drain_set.resweep(allocator) catch |err| {
             std.log.warn(
                 "descendant resweep unavailable ({s}); forcing only verified captured targets",
                 .{@errorName(err)},
             );
         };
-        signalDrainSet(&drain_set, child_pgid, posix.SIG.KILL);
+        signalDrainSet(&drain_set, child_pgid, posix.SIG.KILL, diagnostics);
     }
 
     while (child_state.* == .running) {
@@ -272,10 +300,6 @@ const DiscoveryResult = enum {
     capture_failed,
 };
 
-const OriginalGroupCleanup = enum {
-    retain,
-};
-
 const TeardownDiagnostic = enum {
     incomplete_discovery,
     capture_failed,
@@ -283,14 +307,14 @@ const TeardownDiagnostic = enum {
     target_unavailable,
 };
 
-const DiscoveryDecision = struct {
-    original_group_cleanup: OriginalGroupCleanup = .retain,
+/// The plan is the authority for original-group signaling. Discovery only adds
+/// individually verified targets; it can never suppress the group fast path.
+const DiscoveryPlan = struct {
+    signal_original_group: bool = true,
     diagnostic: ?TeardownDiagnostic = null,
 };
 
-/// This policy is deliberately pure: unit tests can prove that failures retain
-/// original-group cleanup without manufacturing process-tree capabilities.
-fn discoveryDecision(result: DiscoveryResult) DiscoveryDecision {
+fn discoveryPlan(result: DiscoveryResult) DiscoveryPlan {
     return switch (result) {
         .complete => .{},
         .incomplete => .{ .diagnostic = .incomplete_discovery },
@@ -298,16 +322,27 @@ fn discoveryDecision(result: DiscoveryResult) DiscoveryDecision {
     };
 }
 
-fn reportDiscoveryDecision(decision: DiscoveryDecision, detail: ?[]const u8) void {
-    switch (decision.diagnostic orelse return) {
-        .incomplete_discovery => std.log.warn(
-            "descendant snapshot was incomplete; signaling only identities with proven ancestry",
+/// Executes the original-group portion of a discovery plan. Keeping this
+/// separate from process discovery makes the same plan executable in tests.
+fn executeDiscoveryPlan(
+    plan: DiscoveryPlan,
+    child_pgid: posix.pid_t,
+    signal: u8,
+    signal_group: *const fn (posix.pid_t, u8) void,
+) void {
+    if (plan.signal_original_group) signal_group(child_pgid, signal);
+}
+
+fn reportDiscoveryPlan(writer: *std.Io.Writer, plan: DiscoveryPlan, detail: ?[]const u8) void {
+    switch (plan.diagnostic orelse return) {
+        .incomplete_discovery => writer.print(
+            "janitor: descendant snapshot was incomplete; signaling only identities with proven ancestry\n",
             .{},
-        ),
-        .capture_failed => std.log.warn(
-            "descendant snapshot unavailable ({s}); draining only original process group",
+        ) catch |err| reportDiagnosticWriteFailure(err),
+        .capture_failed => writer.print(
+            "janitor: descendant snapshot unavailable ({s}); draining only original process group\n",
             .{detail orelse "unknown"},
-        ),
+        ) catch |err| reportDiagnosticWriteFailure(err),
         else => unreachable,
     }
 }
@@ -330,22 +365,26 @@ fn targetDecision(result: process_tree.TargetResult) TargetDecision {
     };
 }
 
-fn reportTargetDecision(decision: TargetDecision, operation: []const u8) void {
+fn reportTargetDecision(writer: *std.Io.Writer, decision: TargetDecision, operation: []const u8) void {
     const diagnostic = switch (decision) {
         .diagnostic => |value| value,
         else => return,
     };
     switch (diagnostic) {
-        .identity_mismatch => std.log.warn(
-            "captured descendant identity mismatch during {s}; skipped individual target",
+        .identity_mismatch => writer.print(
+            "janitor: captured descendant identity mismatch during {s}; skipped individual target\n",
             .{operation},
-        ),
-        .target_unavailable => std.log.warn(
-            "could not verify captured descendant during {s}",
+        ) catch |err| reportDiagnosticWriteFailure(err),
+        .target_unavailable => writer.print(
+            "janitor: could not verify captured descendant during {s}\n",
             .{operation},
-        ),
+        ) catch |err| reportDiagnosticWriteFailure(err),
         else => unreachable,
     }
+}
+
+fn reportDiagnosticWriteFailure(err: std.Io.Writer.Error) void {
+    std.log.warn("could not emit teardown diagnostic ({s})", .{@errorName(err)});
 }
 
 /// Owns the discovery snapshots behind every individual signal capability.
@@ -357,6 +396,7 @@ const DrainSet = struct {
     captured: std.ArrayList(process_tree.ProcessRecord) = .empty,
     escaped: std.ArrayList(*process_tree.CapturedTarget) = .empty,
     child_pgid: posix.pid_t,
+    plan: DiscoveryPlan = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -371,7 +411,7 @@ const DrainSet = struct {
 
         var snapshot = try process_tree.captureAll(allocator);
         errdefer snapshot.deinit(allocator);
-        reportDiscoveryDecision(discoveryDecision(if (snapshot.incomplete) .incomplete else .complete), null);
+        result.plan = discoveryPlan(if (snapshot.incomplete) .incomplete else .complete);
         const child = findTargetByPid(snapshot.targets, child_pid) orelse return error.ChildNotInSnapshot;
         try appendEscapedClosure(
             allocator,
@@ -477,22 +517,28 @@ fn appendUniqueTarget(
     try targets.append(allocator, target);
 }
 
-fn signalDrainSet(drain_set: *const DrainSet, child_pgid: posix.pid_t, signal: u8) void {
+fn signalDrainSet(
+    drain_set: *const DrainSet,
+    child_pgid: posix.pid_t,
+    signal: u8,
+    diagnostics: *std.Io.Writer,
+) void {
     // This remains the existing group fast path; escaped descendants are never
     // promoted into a group signal target.
-    signalProcessGroup(child_pgid, signal);
+    executeDiscoveryPlan(drain_set.plan, child_pgid, signal, signalProcessGroup);
     for (drain_set.escaped.items) |target| {
-        reportTargetDecision(targetDecision(target.signal(signal)), "individual signal");
+        reportTargetDecision(diagnostics, targetDecision(target.signal(signal)), "individual signal");
     }
 }
 
-fn drainSetAlive(drain_set: *const DrainSet, child_pgid: posix.pid_t) bool {
+fn drainSetAlive(drain_set: *const DrainSet, child_pgid: posix.pid_t, diagnostics: *std.Io.Writer) bool {
     if (isProcessGroupAlive(child_pgid)) return true;
     for (drain_set.escaped.items) |target| {
         switch (targetDecision(target.liveness())) {
             .live => return true,
             .done => {},
             .diagnostic => |diagnostic| reportTargetDecision(
+                diagnostics,
                 .{ .diagnostic = diagnostic },
                 "liveness probe",
             ),
@@ -502,6 +548,7 @@ fn drainSetAlive(drain_set: *const DrainSet, child_pgid: posix.pid_t) bool {
 }
 
 fn teardownGroupOnly(
+    plan: DiscoveryPlan,
     child_pid: posix.pid_t,
     child_pgid: posix.pid_t,
     config: Config,
@@ -509,7 +556,7 @@ fn teardownGroupOnly(
     child_state: *ChildState,
 ) u8 {
     if (isProcessGroupAlive(child_pgid)) {
-        signalProcessGroup(child_pgid, posix.SIG.TERM);
+        executeDiscoveryPlan(plan, child_pgid, posix.SIG.TERM, signalProcessGroup);
 
         const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
         while (monotonicNowNs() < deadline_ns) {
@@ -523,7 +570,7 @@ fn teardownGroupOnly(
         }
 
         if (isProcessGroupAlive(child_pgid)) {
-            signalProcessGroup(child_pgid, posix.SIG.KILL);
+            executeDiscoveryPlan(plan, child_pgid, posix.SIG.KILL, signalProcessGroup);
         }
     }
 
@@ -1092,28 +1139,53 @@ test "versionLine renders version and git sha" {
     try std.testing.expect(std.mem.indexOfScalar(u8, line, ')') != null);
 }
 
-test "discovery decisions diagnose limitations and retain original group cleanup" {
+test "discovery plan executes original-group cleanup and reports limitations" {
+    const Recorder = struct {
+        var calls: usize = 0;
+        var pgid: posix.pid_t = 0;
+        var signal: u8 = 0;
+
+        fn signalGroup(child_pgid: posix.pid_t, value: u8) void {
+            calls += 1;
+            pgid = child_pgid;
+            signal = value;
+        }
+    };
+
     const cases = [_]struct {
         result: DiscoveryResult,
-        diagnostic: ?TeardownDiagnostic,
+        detail: ?[]const u8,
+        condition: []const u8,
     }{
-        .{ .result = .incomplete, .diagnostic = .incomplete_discovery },
-        .{ .result = .capture_failed, .diagnostic = .capture_failed },
+        .{ .result = .incomplete, .detail = null, .condition = "incomplete" },
+        .{ .result = .capture_failed, .detail = "ProcessNotFound", .condition = "unavailable (ProcessNotFound)" },
     };
 
     for (cases) |case| {
-        const decision = discoveryDecision(case.result);
-        try std.testing.expectEqual(OriginalGroupCleanup.retain, decision.original_group_cleanup);
-        try std.testing.expectEqual(case.diagnostic, decision.diagnostic);
+        Recorder.calls = 0;
+        const plan = discoveryPlan(case.result);
+        executeDiscoveryPlan(plan, 4321, posix.SIG.TERM, Recorder.signalGroup);
+        try std.testing.expect(plan.signal_original_group);
+        try std.testing.expectEqual(@as(usize, 1), Recorder.calls);
+        try std.testing.expectEqual(@as(posix.pid_t, 4321), Recorder.pgid);
+        try std.testing.expectEqual(posix.SIG.TERM, Recorder.signal);
+
+        var output: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&output);
+        reportDiscoveryPlan(&writer, plan, case.detail);
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), case.condition) != null);
     }
 }
 
-test "stale descendant identity is diagnosed and retains original group cleanup" {
+test "stale descendant identity from completed discovery is diagnosed" {
+    const plan = discoveryPlan(.complete);
     const decision = targetDecision(.stale);
     const expected: TargetDecision = .{ .diagnostic = .identity_mismatch };
     try std.testing.expectEqual(expected, decision);
-    try std.testing.expectEqual(
-        OriginalGroupCleanup.retain,
-        discoveryDecision(.complete).original_group_cleanup,
-    );
+
+    var output: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    reportTargetDecision(&writer, decision, "individual signal");
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "identity mismatch") != null);
+    try std.testing.expect(plan.signal_original_group);
 }

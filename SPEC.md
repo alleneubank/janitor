@@ -352,8 +352,10 @@ the original child process group.
 - REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023:
   `src/process_tree.zig` identity-validation, PID-reuse, bounded-resweep,
   incomplete-discovery, and unrelated-process-exclusion unit coverage; plus
-  `src/root.zig` `discovery decisions diagnose limitations and retain original
-  group cleanup` and `stale descendant identity is diagnosed and retains
-  original group cleanup` integration-policy tests.
+  `src/root.zig` `discovery plan executes original-group cleanup and reports
+  limitations`, which executes the production plan with a recorder and captures
+  incomplete/capture-failure diagnostics, and `stale descendant identity from
+  completed discovery is diagnosed`, which captures the stale-identity
+  diagnostic from the production reporter.
 - REQ-JANITOR-026: `src/root.zig` explicit unsupported-platform diagnostic and
   `nix develop -c zig build -Dtarget=x86_64-linux` supported-target build.
