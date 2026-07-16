@@ -2,8 +2,11 @@
 
 ## Bar
 
-Janitor supervision is shippable when teardown drains the live owned process
-set without risking a signal to an unrelated process.
+Janitor supervision is shippable when teardown signals only its original child
+process group or descendants that pass the strongest platform identity
+verification: Linux signals atomically through stable pidfds, while Darwin/BSD
+immediately revalidate `(pid, start_time)` before `kill(pid, signal)` with the
+residual validation-to-`kill` race explicitly acknowledged.
 
 ## Dimensions
 

@@ -278,13 +278,14 @@ the original child process group.
 ## Risk Classification
 
 - **HIGH — widened process-signal authority and public CLI/default behavior:**
-  REQ-JANITOR-017 through REQ-JANITOR-024 make descendant-aware teardown the
+  REQ-JANITOR-017 through REQ-JANITOR-026 make descendant-aware teardown the
   default, add the public `--pgroup-only` opt-out, and authorize individual
   process signals outside the original child process group. Signal safety and
   the documented platform limits are implementation gates.
-- **PLAN gate:** The active implementation plan is `.rl/task.md`, ratified by
-  the user. Its Phase 1 contract and quality-floor gate governs this HIGH-risk
-  change before runtime implementation proceeds.
+- **PLAN gate:** The widened signal authority and public default/CLI change are
+  ratified for REQ-JANITOR-017 through REQ-JANITOR-026, subject to their
+  signal-safety invariants, acceptance criteria, and independent review gate.
+  This SPEC is the durable approval record for this HIGH-risk change.
 
 ## Test Traceability
 
