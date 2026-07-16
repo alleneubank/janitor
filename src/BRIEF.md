@@ -4,9 +4,10 @@
 
 Janitor supervision is shippable when teardown signals only its original child
 process group or descendants that pass the strongest platform identity
-verification: Linux signals atomically through stable pidfds, while Darwin/BSD
-immediately revalidate `(pid, start_time)` before `kill(pid, signal)` with the
-residual validation-to-`kill` race explicitly acknowledged.
+verification: Linux binds the ancestry-proving process-table record to the
+stable handle used for liveness and signaling, while Darwin/BSD immediately
+revalidate `(pid, start_time)` before `kill(pid, signal)` with the residual
+validation-to-`kill` race explicitly acknowledged.
 
 ## Dimensions
 
@@ -18,17 +19,23 @@ residual validation-to-`kill` race explicitly acknowledged.
 ## Floors
 
 - Process-tree unit tests prove PPID closure, unrelated-process exclusion,
-  identity mismatch/PID reuse rejection, and bounded-resweep anchoring.
+  identity mismatch/PID reuse rejection, and bounded-resweep anchoring. They
+  include the Linux acquisition race: an old descendant record, a recycled
+  unrelated PID, and a stable handle to that replacement must never enter the
+  drain set.
 - Compiled-binary e2e tests prove that default teardown drains a live `setsid()`
   descendant, while `--pgroup-only` preserves the process-group-only escape
   hatch; fixtures clean up every process on failure.
 - Native-platform verification proves the documented identity and individual
-  signaling path on every advertised descendant-drain platform: Linux holds and
-  signals through pidfds; Darwin/BSD capture start time and immediately
-  re-read `(pid, start_time)` before `kill(pid, signal)`. Darwin/BSD's
-  validation-to-`kill` TOCTOU is documented as a native limit, not claimed
-  away. An unsupported path is a fail-closed documentation or implementation
-  block, not a silent fallback.
+  signaling path on every advertised descendant-drain platform: Linux acquires
+  a stable process reference before reading the PPID, start-time, and PGID
+  record that establishes ancestry, then uses that reference or a pidfd proven
+  bound to the same record for liveness and signaling. A later `pidfd_open` of
+  an unbound numeric snapshot cannot satisfy this floor. Darwin/BSD capture
+  start time and immediately re-read `(pid, start_time)` before `kill(pid,
+  signal)`. Darwin/BSD's validation-to-`kill` TOCTOU is documented as a native
+  limit, not claimed away. An unsupported path is a fail-closed documentation
+  or implementation block, not a silent fallback.
 - Diagnostics tests prove incomplete discovery still drains the original group,
   reports the limitation, and never broadens individual signal targets.
 
@@ -42,8 +49,10 @@ oracle is the implementing agent's self-assessment.
 ## Never
 
 - Never knowingly signal an individual target whose required platform identity
-  verification is mismatched, unavailable, or stale. Linux pidfds prevent PID
-  reuse from redirecting an individual signal; Darwin/BSD must immediately
+  verification is mismatched, unavailable, or stale. On Linux, a stable handle
+  acquired after an unbound numeric process-table record is insufficient: the
+  handle must be linked to the exact record that proved ancestry, and a
+  replacement after PID recycling is rejected. Darwin/BSD must immediately
   re-read `(pid, start_time)` before `kill(pid, signal)` and must document the
   unavoidable validation-to-`kill` TOCTOU.
 - Never signal a process group other than the original group Janitor created.

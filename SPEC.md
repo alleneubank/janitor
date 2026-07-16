@@ -30,9 +30,15 @@ the original child process group.
 - **Drain set**: the original child process group plus the individually handled
   escaped descendants in the live snapshot. Its liveness governs escalation.
 - **Process identity**: the PID together with platform-specific evidence that
-  the PID still denotes the captured process. On Linux, an open pidfd is a
-  stable kernel reference and is the handle used for each individual signal. On
-  Darwin/BSD, Janitor captures start time and immediately re-reads
+  the PID still denotes the captured process. On Linux, numeric enumeration is
+  only a lead: Janitor acquires a stable `/proc/<pid>` process reference before
+  reading the PPID, start-time, and PGID process-table record that proves
+  ownership. It retains that reference or a pidfd provably bound to the same
+  record for liveness and `pidfd_send_signal`; a pidfd opened after an unbound
+  numeric snapshot is not identity evidence. If the process exits or its PID is
+  recycled between enumeration and stable-handle acquisition, Janitor rejects
+  the record rather than accepting a replacement. On Darwin/BSD, Janitor
+  captures start time and immediately re-reads
   `(pid, start_time)` before each individual `kill(pid, signal)`; a mismatch is
   skipped and diagnosed. Darwin/BSD expose an unavoidable validation-to-`kill`
   TOCTOU: PID reuse after the re-read and before `kill` cannot be atomically
@@ -120,14 +126,19 @@ the original child process group.
   path and is the only process group it signals wholesale. It individually
   signals each identity-verified escaped descendant; it never signals every
   process group represented by the snapshot.
-- **REQ-JANITOR-021**: Before every individual descendant signal, Janitor
-  applies the platform's identity procedure. On Linux, it signals through the
-  captured pidfd, a stable process reference, so PID reuse cannot redirect that
-  individual signal. On Darwin/BSD, it captures start time and immediately
-  re-reads `(pid, start_time)` before `kill(pid, signal)`, skipping and
-  diagnosing a mismatch. Darwin/BSD cannot atomically eliminate the
-  validation-to-`kill` TOCTOU, so a reuse after revalidation and before `kill`
-  remains an explicitly documented platform limit.
+- **REQ-JANITOR-021**: Before accepting an individual Linux descendant, Janitor
+  acquires a stable process reference and reads the PPID, start-time, and PGID
+  process-table record that proves its ancestry through that reference. Janitor
+  retains that reference, or a pidfd it has proven is bound to the same record,
+  for liveness and `pidfd_send_signal`; opening a pidfd after reading an
+  unbound numeric `/proc/<pid>/stat` snapshot does not satisfy this requirement.
+  A record is rejected and diagnosed when the process exits or its PID is
+  recycled between numeric enumeration and stable-handle acquisition. On
+  Darwin/BSD, Janitor captures start time and immediately re-reads
+  `(pid, start_time)` before `kill(pid, signal)`, skipping and diagnosing a
+  mismatch. Darwin/BSD cannot atomically eliminate the validation-to-`kill`
+  TOCTOU, so a reuse after revalidation and before `kill` remains an explicitly
+  documented platform limit.
 - **REQ-JANITOR-022**: Before forced teardown, Janitor performs a bounded
   resweep to narrow the snapshot-to-signal spawn race. A resweep may add only a
   process whose ancestry is proven from a still-matching captured identity.
@@ -193,9 +204,12 @@ the original child process group.
   `SIGTERM` unless `--pgroup-only` was selected.
 - Janitor signals only the child process group wholesale. It signals escaped
   descendants individually only after its platform identity procedure succeeds:
-  Linux signals through the captured pidfd, while Darwin/BSD immediately
-  re-read the captured `(pid, start_time)` before `kill(pid, signal)` and skip
-  a mismatch. Darwin/BSD retain the documented validation-to-`kill` TOCTOU.
+  Linux binds the ancestry-proving PPID, start-time, and PGID process-table
+  record to the stable handle used for liveness and `pidfd_send_signal`; a
+  pidfd acquired after an unbound numeric record is rejected. Darwin/BSD
+  immediately re-read the captured `(pid, start_time)` before `kill(pid,
+  signal)` and skip a mismatch. Darwin/BSD retain the documented
+  validation-to-`kill` TOCTOU.
 - Discovery failure or an unverifiable descendant never prevents cleanup of the
   original child process group and never broadens the target set by inference.
 - The bounded resweep adds only descendants with a still-proven, live ancestry.
@@ -247,6 +261,10 @@ the original child process group.
 - [x] `zig build test` runs unit tests and the e2e process tests.
 - [x] `zig build fmt` passes.
 - [x] Supported platforms use kqueue/epoll event waits instead of idle polling.
+- [ ] Process-tree unit tests prove that an old descendant process-table record
+      whose numeric PID is recycled before stable-handle acquisition cannot add
+      the unrelated replacement—even when the acquired stable handle names that
+      replacement—to the drain set.
 - [ ] With a controlling terminal, the child process group becomes the
       terminal's foreground process group after spawn, and the original
       foreground process group is restored after teardown.
