@@ -117,9 +117,10 @@ fn testWatchPathDrainsDetachedDescendant(
     defer {
         if (!janitor_reaped) {
             // Let Janitor run its normal signal teardown before forcefully
-            // reaping it, so a pre-readiness failure does not strand its child.
-            posix.kill(janitor.id, posix.SIG.TERM) catch {};
-            _ = janitor.wait() catch {};
+            // reaping it, so a pre-readiness failure does not strand its
+            // child. Each reap is bounded: a broken implementation must not
+            // turn an e2e assertion into a permanently hung suite.
+            janitor_reaped = reapFixtureJanitor(&janitor);
         }
     }
 
@@ -128,13 +129,17 @@ fn testWatchPathDrainsDetachedDescendant(
     defer if (detached_cleanup_required) killAndWaitForProcessGone(detached_pid);
 
     if (!processExists(detached_pid)) {
+        // The liveness check rules out this numeric PID as our fixture. Do
+        // not let the deferred fallback race PID reuse and signal a stranger.
+        detached_cleanup_required = false;
         std.debug.print("detached fixture pid {d} exited before teardown\n", .{detached_pid});
         return error.DetachedFixtureNotLive;
     }
 
     try std.fs.cwd().deleteFile(watch_path);
-    try expectExitedAny(try janitor.wait(), "detached-descendant teardown exits instead of hanging");
+    const janitor_term = try waitForChildTerm(&janitor, 3000, "detached-descendant teardown");
     janitor_reaped = true;
+    try expectExitedAny(janitor_term, "detached-descendant teardown exits instead of hanging");
 
     waitForProcessGone(detached_pid, 3000) catch |err| {
         std.debug.print("detached descendant {d} survived Janitor teardown\n", .{detached_pid});
@@ -564,7 +569,7 @@ fn waitForProcessGone(pid: posix.pid_t, timeout_ms: u64) !void {
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
 
-    return error.Timeout;
+    return error.ProcessWaitTimedOut;
 }
 
 fn processExists(pid: posix.pid_t) bool {
@@ -582,10 +587,69 @@ fn killAndWaitForProcessGone(pid: posix.pid_t) void {
     // the sandbox deletion cannot hide a leaked process.
     posix.kill(pid, posix.SIG.KILL) catch |err| switch (err) {
         error.ProcessNotFound => return,
-        else => return,
+        else => {
+            std.debug.print("failed to SIGKILL detached fixture pid {d}: {s}\n", .{ pid, @errorName(err) });
+            return;
+        },
     };
     waitForProcessGone(pid, 3000) catch |err| {
-        std.debug.print("warning: detached fixture pid {d} survived cleanup: {s}\n", .{ pid, @errorName(err) });
+        std.debug.print("detached fixture pid {d} cleanup wait failed: {s}\n", .{ pid, @errorName(err) });
+    };
+}
+
+// `std.process.Child.wait` is deliberately blocking. The fixture instead
+// polls waitpid with W.NOHANG so a regression in Janitor's teardown cannot
+// stall the entire e2e suite. This raw reap consumes the child status, so the
+// caller must mark its Child as reaped and never call Child.wait afterwards.
+fn waitForChildTerm(
+    child: *std.process.Child,
+    timeout_ms: u64,
+    context: []const u8,
+) !std.process.Child.Term {
+    const deadline_ns = monotonicNowNs() + timeout_ms * std.time.ns_per_ms;
+    while (monotonicNowNs() < deadline_ns) {
+        const result = posix.waitpid(child.id, posix.W.NOHANG);
+        if (result.pid != 0) return childTermFromWaitStatus(result.status);
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+
+    std.debug.print("{s}: child pid {d} did not exit within {d}ms\n", .{ context, child.id, timeout_ms });
+    return error.ChildWaitTimedOut;
+}
+
+fn childTermFromWaitStatus(status: u32) std.process.Child.Term {
+    return if (posix.W.IFEXITED(status))
+        .{ .Exited = posix.W.EXITSTATUS(status) }
+    else if (posix.W.IFSIGNALED(status))
+        .{ .Signal = posix.W.TERMSIG(status) }
+    else if (posix.W.IFSTOPPED(status))
+        .{ .Stopped = posix.W.STOPSIG(status) }
+    else
+        .{ .Unknown = status };
+}
+
+// Failure cleanup follows the same escalation contract as the fixture under
+// test: request orderly teardown, wait a bounded interval, then force it down
+// and wait once more. ProcessNotFound is benign; every other failure remains
+// visible because it can leave fixture processes behind.
+fn reapFixtureJanitor(janitor: *std.process.Child) bool {
+    signalFixtureProcess(janitor.id, posix.SIG.TERM, "SIGTERM");
+    _ = waitForChildTerm(janitor, 3000, "fixture cleanup after SIGTERM") catch {
+        signalFixtureProcess(janitor.id, posix.SIG.KILL, "SIGKILL");
+        _ = waitForChildTerm(janitor, 3000, "fixture cleanup after SIGKILL") catch return false;
+    };
+    return true;
+}
+
+fn signalFixtureProcess(pid: posix.pid_t, signal: u8, signal_name: []const u8) void {
+    posix.kill(pid, signal) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => {
+            std.debug.print(
+                "failed to send {s} to fixture child pid {d}: {s}\n",
+                .{ signal_name, pid, @errorName(err) },
+            );
+        },
     };
 }
 
