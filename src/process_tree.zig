@@ -833,28 +833,39 @@ const proc_pgrp_only = 2;
 /// `proc_listpids(PROC_PGRP_ONLY, ...)` is the Darwin membership authority.
 /// Its kernel-side PGID filter avoids inspecting unrelated process records,
 /// which routinely fail with EPERM under macOS privacy policy.
-const DarwinGroupMembershipEnumeration = union(enum) {
-    pids: []const c_int,
-    unavailable,
-};
-
 /// Classifies the complete result of a kernel-filtered PGID enumeration. The
 /// enumerator has already established the PGID, so another returned PID is a
 /// member without a `proc_pidinfo` record read. A PID that exits before the
 /// subsequent group signal is harmlessly treated as gone by that signal path.
 fn classifyDarwinGroupMembershipEnumeration(
-    enumeration: DarwinGroupMembershipEnumeration,
+    pids: []const c_int,
     reserved_zombie_pid: posix.pid_t,
 ) GroupMembership {
-    switch (enumeration) {
-        .unavailable => return .unknown,
-        .pids => |pids| {
-            for (pids) |pid| {
-                if (pid > 0 and pid != reserved_zombie_pid) return .live;
-            }
-            return .none;
-        },
+    for (pids) |pid| {
+        if (pid > 0 and pid != reserved_zombie_pid) return .live;
     }
+    return .none;
+}
+
+/// `proc_listpids` reports the number of bytes it wrote, not the number of
+/// `pid_t` values. Its wrapper reports zero for failure, so every non-positive
+/// or partial element count is unavailable rather than an empty group.
+fn darwinPidCountFromByteCount(byte_count: c_int) ?usize {
+    if (byte_count <= 0) return null;
+    const bytes: usize = @intCast(byte_count);
+    const pid_size = @sizeOf(posix.pid_t);
+    if (bytes % pid_size != 0) return null;
+    return bytes / pid_size;
+}
+
+fn classifyDarwinGroupMembershipByteEnumeration(
+    pids: []const c_int,
+    byte_count: c_int,
+    reserved_zombie_pid: posix.pid_t,
+) GroupMembership {
+    const count = darwinPidCountFromByteCount(byte_count) orelse return .unknown;
+    if (count > pids.len) return .unknown;
+    return classifyDarwinGroupMembershipEnumeration(pids[0..count], reserved_zombie_pid);
 }
 
 fn groupMembershipDarwin(
@@ -866,9 +877,8 @@ fn groupMembershipDarwin(
 
     if (child_pgid <= 0) return .unknown;
     const pgid: c_uint = @intCast(child_pgid);
-    const initial_count = proc_listpids(proc_pgrp_only, pgid, null, 0);
-    if (initial_count <= 0) return .unknown;
-    var capacity: usize = @intCast(initial_count);
+    const initial_bytes = proc_listpids(proc_pgrp_only, pgid, null, 0);
+    var capacity = darwinPidCountFromByteCount(initial_bytes) orelse return .unknown;
     capacity = std.math.add(usize, capacity, 64) catch return .unknown;
 
     var attempt: usize = 0;
@@ -877,14 +887,13 @@ fn groupMembershipDarwin(
         defer allocator.free(pids);
         const bytes = std.math.mul(usize, capacity, @sizeOf(c_int)) catch return .unknown;
         const byte_capacity = std.math.cast(c_int, bytes) orelse return .unknown;
-        const count = proc_listpids(proc_pgrp_only, pgid, @ptrCast(pids.ptr), byte_capacity);
-        if (count < 0) return .unknown;
-        const actual: usize = @intCast(count);
+        const result_bytes = proc_listpids(proc_pgrp_only, pgid, @ptrCast(pids.ptr), byte_capacity);
+        const actual = darwinPidCountFromByteCount(result_bytes) orelse return .unknown;
         if (actual >= capacity) {
             capacity = std.math.add(usize, actual, 64) catch return .unknown;
             continue;
         }
-        return classifyDarwinGroupMembershipEnumeration(.{ .pids = pids[0..actual] }, reserved_zombie_pid);
+        return classifyDarwinGroupMembershipEnumeration(pids[0..actual], reserved_zombie_pid);
     }
     return .unknown;
 }
@@ -1381,32 +1390,53 @@ test "group membership walk distinguishes disappearance from unavailable entries
 test "Darwin membership enumeration needs no per-PID record reads" {
     const Case = struct {
         name: []const u8,
-        enumeration: DarwinGroupMembershipEnumeration,
+        pids: []const c_int,
+        byte_count: c_int,
         expected: GroupMembership,
     };
-    const zombie_only = [_]c_int{70};
+    // The second entry is intentionally live: treating bytes as an element
+    // count would inspect it and incorrectly classify this one-PID result.
+    const zombie_only = [_]c_int{ 70, 71, 71, 71 };
     const live_member = [_]c_int{ 70, 71 };
     const cases = [_]Case{
         .{
             .name = "only the retained zombie has no live group member",
-            .enumeration = .{ .pids = &zombie_only },
+            .pids = &zombie_only,
+            .byte_count = @sizeOf(posix.pid_t),
             .expected = .none,
         },
         .{
             .name = "another enumerated PID keeps the group live",
-            .enumeration = .{ .pids = &live_member },
+            .pids = &live_member,
+            .byte_count = @sizeOf(@TypeOf(live_member)),
             .expected = .live,
         },
         .{
+            .name = "partial PID byte count leaves membership unknown",
+            .pids = &live_member,
+            .byte_count = @sizeOf(posix.pid_t) - 1,
+            .expected = .unknown,
+        },
+        .{
             .name = "enumeration failure leaves membership unknown",
-            .enumeration = .unavailable,
+            .pids = &live_member,
+            .byte_count = 0,
+            .expected = .unknown,
+        },
+        .{
+            .name = "byte count beyond the supplied buffer leaves membership unknown",
+            .pids = &live_member,
+            .byte_count = @sizeOf(@TypeOf(live_member)) + @sizeOf(posix.pid_t),
             .expected = .unknown,
         },
     };
 
     for (cases) |case| {
         errdefer std.log.err("Darwin membership case failed: {s}", .{case.name});
-        try std.testing.expectEqual(case.expected, classifyDarwinGroupMembershipEnumeration(case.enumeration, 70));
+        try std.testing.expectEqual(
+            case.expected,
+            classifyDarwinGroupMembershipByteEnumeration(case.pids, case.byte_count, 70),
+        );
     }
 }
 
