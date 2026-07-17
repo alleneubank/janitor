@@ -316,6 +316,7 @@ A2 passed in the spike, so these are recorded only as fallback context:
 ## Out of scope
 
 - Windows (janitor non-goal; hook passes through).
-- Children that `setsid()` away from the wrapped shell's group (janitor's
-  documented limitation; would need their own nested janitor).
+- Detached `setsid()` descendants beyond Janitor's bounded,
+  identity-verified drain set (default draining covers captured detached
+  descendants; `--pgroup-only` opts out to process-group-only teardown).
 - A persistent daemon/registry (janitor non-goal).

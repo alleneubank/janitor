@@ -303,17 +303,18 @@ fn teardownWithDiagnostics(
         };
     }
     // A process can disappear from the second process-table enumeration while
-    // its retained Linux handle still proves it is the captured identity. If
-    // the original group is already dead, such a live captured target must
-    // have escaped it; publish that exact capability for individual draining.
+    // its retained capability still proves it is the captured identity. Check
+    // every initially in-group capture independently: a live process that has
+    // left the original group (or whose current membership cannot be proven)
+    // must be retained for individual KILL even if another group member lives.
+    drain_set.promoteEscapedCapturedTargets(allocator, diagnostics) catch |err| {
+        std.log.warn(
+            "could not retain escaped captured descendants after resweep ({s})",
+            .{@errorName(err)},
+        );
+    };
     if (originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*) == .none) {
         drain_set.original_group_dead = true;
-        drain_set.promoteLiveCapturedTargets(allocator) catch |err| {
-            std.log.warn(
-                "could not retain live captured descendants after resweep ({s})",
-                .{@errorName(err)},
-            );
-        };
     }
 
     var sent_kill = false;
@@ -645,19 +646,56 @@ const DrainSet = struct {
         self.reswept = snapshot;
     }
 
-    /// After the original group dies, a live capability captured from that
-    /// group can only name an escaped process. This covers a TERM handler that
-    /// calls setsid() and is reparented before the resweep's numeric scan can
-    /// read it, without authorizing any PID that was not captured initially.
-    fn promoteLiveCapturedTargets(self: *DrainSet, allocator: std.mem.Allocator) !void {
+    /// Retains an initially in-group capability when its own revalidated state
+    /// says it escaped, regardless of other original-group members. An unknown
+    /// membership is also retained: its preceding live probe proves the exact
+    /// captured identity, while treating unknown as in-group could leak it.
+    fn promoteEscapedCapturedTargets(
+        self: *DrainSet,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.Io.Writer,
+    ) !void {
         const initial = self.initial orelse return;
         for (initial.targets) |target| {
             if (!containsCapturedIdentity(self.captured.items, target.record().identity)) continue;
-            if (target.liveness() != .live) continue;
-            try appendUniqueTarget(allocator, &self.escaped, target);
+            if (target.record().isEscaped(self.child_pgid)) continue;
+            const action = capturedTargetPromotion(target.liveness(), target.groupStatus(self.child_pgid));
+            switch (action) {
+                .retain => try appendUniqueTarget(allocator, &self.escaped, target),
+                .skip => {},
+                .diagnostic => |decision| reportTargetDecision(diagnostics, decision, "captured target promotion"),
+            }
         }
     }
 };
+
+const CapturedTargetPromotion = union(enum) {
+    retain,
+    skip,
+    diagnostic: TargetDecision,
+};
+
+/// Pure escalation seam: individual retention is authorized only after a
+/// retained identity reports live. A stale identity is diagnosed and never
+/// retained; an unconfirmed membership is conservative only about cleanup
+/// breadth, never about identity safety.
+fn capturedTargetPromotion(
+    liveness: process_tree.TargetResult,
+    group_status: process_tree.TargetGroupStatus,
+) CapturedTargetPromotion {
+    switch (liveness) {
+        .live => {},
+        else => return switch (targetDecision(liveness)) {
+            .diagnostic => |diagnostic| .{ .diagnostic = .{ .diagnostic = diagnostic } },
+            .live, .done => .skip,
+        },
+    }
+    return switch (group_status) {
+        .escaped, .unknown => .retain,
+        .in_group => .skip,
+        .stale => .{ .diagnostic = .{ .diagnostic = .identity_mismatch } },
+    };
+}
 
 fn containsCapturedIdentity(
     captured: []const process_tree.ProcessRecord,
@@ -1695,6 +1733,33 @@ test "forced teardown resweeps an in-group capture that escapes after TERM" {
     try std.testing.expect(action.resweep);
     try std.testing.expect(!action.signal_original_group);
     try std.testing.expect(action.signal_escaped_targets);
+}
+
+test "escaped captured target escalates individually while the original group remains live" {
+    // A failed resweep cannot revoke a previously captured, still-live
+    // capability. The group action remains necessary for another live member;
+    // the escaped target gets its own KILL action alongside it.
+    const group_action = drainSignalAction(discoveryPlan(.complete), true, false);
+    try std.testing.expect(group_action.signal_original_group);
+
+    const target_action = capturedTargetPromotion(.live, .escaped);
+    try std.testing.expectEqual(CapturedTargetPromotion.retain, target_action);
+}
+
+test "captured target identity mismatch is diagnosed instead of individually signaled" {
+    const action = capturedTargetPromotion(.stale, .escaped);
+    const expected: CapturedTargetPromotion = .{
+        .diagnostic = .{ .diagnostic = .identity_mismatch },
+    };
+    try std.testing.expectEqual(expected, action);
+
+    var output: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    switch (action) {
+        .diagnostic => |decision| reportTargetDecision(&writer, decision, "captured target promotion"),
+        else => unreachable,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "identity mismatch") != null);
 }
 
 test "teardown reaps after every numeric group signal" {

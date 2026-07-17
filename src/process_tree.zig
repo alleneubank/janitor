@@ -301,6 +301,16 @@ pub const TargetResult = union(enum) {
     unexpected_errno: posix.E,
 };
 
+/// The current relation of a retained target to Janitor's original process
+/// group. This probe never authorizes a numeric signal: callers still signal
+/// only through `CapturedTarget.signal`, which revalidates the identity.
+pub const TargetGroupStatus = enum {
+    in_group,
+    escaped,
+    stale,
+    unknown,
+};
+
 /// An opaque, snapshot-owned authorization to act on one captured identity.
 /// Its representation is deliberately unavailable to callers: a PID or
 /// `ProcessIdentity` can inspect a target but can never manufacture, retarget,
@@ -327,6 +337,20 @@ pub const CapturedTarget = opaque {
             .linux_proc_dir => |fd| linuxSignalResult(fd, signal_number),
             .darwin_revalidate => darwinSignalResult(target.record.identity, signal_number, .signaled),
         };
+    }
+
+    /// Revalidates this target's identity while reading its current PGID. An
+    /// unavailable PGID is deliberately distinct from `in_group`: callers may
+    /// retain a separately live, captured capability rather than guessing it
+    /// remains covered by the original group.
+    pub fn groupStatus(self: *const CapturedTarget, original_pgid: posix.pid_t) TargetGroupStatus {
+        const target = targetImplConst(self);
+        const current = switch (target.handle) {
+            .linux_proc_dir => |fd| linuxTargetRecord(fd),
+            .darwin_revalidate => darwinTargetRecord(target.record.identity),
+        } orelse return .unknown;
+        if (!current.identity.eql(target.record.identity)) return .stale;
+        return if (current.pgid == original_pgid) .in_group else .escaped;
     }
 };
 
@@ -772,6 +796,14 @@ fn linuxSignalResult(fd: posix.fd_t, signal: u8) TargetResult {
     return signalResultFromErrno(posix.errno(std.os.linux.pidfd_send_signal(fd, @intCast(signal), null, 0)), signal);
 }
 
+fn linuxTargetRecord(fd: posix.fd_t) ?ProcessRecord {
+    if (comptime builtin.os.tag != .linux) return null;
+    // The retained directory FD, rather than a reopened numeric `/proc/PID`,
+    // remains bound to the identity captured during discovery.
+    const process: std.fs.Dir = .{ .fd = fd };
+    return (readLinuxStat(process) catch return null) orelse return null;
+}
+
 fn signalResultFromErrno(errno_code: posix.E, signal: u8) TargetResult {
     return switch (errno_code) {
         .SUCCESS => if (signal == 0) .live else .signaled,
@@ -858,6 +890,14 @@ fn darwinPidCountFromByteCount(byte_count: c_int) ?usize {
     return bytes / pid_size;
 }
 
+/// `proc_listallpids` returns a PID count, but libproc maps its underlying
+/// failures to zero. A populated process table can never be empty, so zero is
+/// unknown/failure rather than a successful empty snapshot.
+fn darwinPidCountFromProcessCount(process_count: c_int) ?usize {
+    if (process_count <= 0) return null;
+    return @intCast(process_count);
+}
+
 fn classifyDarwinGroupMembershipByteEnumeration(
     pids: []const c_int,
     byte_count: c_int,
@@ -904,8 +944,9 @@ fn captureDarwin(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocato
     // bounded slack and retry on a full buffer so a growing table is marked
     // incomplete rather than silently truncated.
     const initial_count = proc_listallpids(null, 0);
-    if (initial_count <= 0) return error.SnapshotSetupFailed;
-    var capacity = std.math.add(usize, @intCast(initial_count), 64) catch return error.SnapshotSetupFailed;
+    const initial_capacity = darwinPidCountFromProcessCount(initial_count) orelse
+        return error.SnapshotSetupFailed;
+    var capacity = std.math.add(usize, initial_capacity, 64) catch return error.SnapshotSetupFailed;
     var pids: []c_int = undefined;
     var actual_count: usize = 0;
     var incomplete = false;
@@ -920,11 +961,10 @@ fn captureDarwin(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocato
             allocator.free(pids);
             return error.SnapshotSetupFailed;
         });
-        if (result < 0) {
+        actual_count = darwinPidCountFromProcessCount(result) orelse {
             allocator.free(pids);
             return error.SnapshotSetupFailed;
-        }
-        actual_count = @intCast(result);
+        };
         if (actual_count < capacity) break;
         allocator.free(pids);
         if (attempt == 2) {
@@ -936,11 +976,10 @@ fn captureDarwin(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocato
                 allocator.free(pids);
                 return error.SnapshotSetupFailed;
             });
-            if (final_result < 0) {
+            actual_count = darwinPidCountFromProcessCount(final_result) orelse {
                 allocator.free(pids);
                 return error.SnapshotSetupFailed;
-            }
-            actual_count = @intCast(final_result);
+            };
             break;
         }
         capacity = std.math.add(usize, actual_count, 64) catch return error.SnapshotSetupFailed;
@@ -1017,6 +1056,11 @@ fn captureDarwinBoundRecord(pid: posix.pid_t) ?ProcessRecord {
     if (!parent_after.identity.eql(parent_before.identity)) return null;
     record.parent_identity = parent_before.identity;
     return record;
+}
+
+fn darwinTargetRecord(identity: ProcessIdentity) ?ProcessRecord {
+    if (comptime builtin.os.tag != .macos) return null;
+    return captureDarwinRecord(identity.pid);
 }
 
 fn darwinSignalResult(identity: ProcessIdentity, signal: u8, success: TargetResult) TargetResult {
@@ -1437,6 +1481,24 @@ test "Darwin membership enumeration needs no per-PID record reads" {
             case.expected,
             classifyDarwinGroupMembershipByteEnumeration(case.pids, case.byte_count, 70),
         );
+    }
+}
+
+test "Darwin process enumeration rejects zero libproc counts" {
+    const cases = [_]struct {
+        name: []const u8,
+        result: c_int,
+        expected: ?usize,
+    }{
+        .{ .name = "sizing failure reports zero", .result = 0, .expected = null },
+        .{ .name = "populated failure reports zero", .result = 0, .expected = null },
+        .{ .name = "negative result is unavailable", .result = -1, .expected = null },
+        .{ .name = "positive PID count is usable", .result = 17, .expected = 17 },
+    };
+
+    for (cases) |case| {
+        errdefer std.log.err("Darwin process enumeration case failed: {s}", .{case.name});
+        try std.testing.expectEqual(case.expected, darwinPidCountFromProcessCount(case.result));
     }
 }
 

@@ -400,7 +400,12 @@ the original child process group.
   `testWatchPathTermEscapeDescendant` proves a descendant captured in the
   original group can call `setsid()` from its TERM handler, be rediscovered
   from its retained identity during the bounded resweep, and be individually
-  drained after the original group dies.
+  drained after the original group dies. `src/root.zig`
+  `escaped captured target escalates individually while the original group
+  remains live` additionally proves the resweep-unavailable planner path
+  retains a live, escaped captured target for individual KILL alongside the
+  original-group KILL; its identity-mismatch companion proves that stale
+  identities are diagnosed and skipped.
 - REQ-JANITOR-026: `src/root.zig` `discovery plan executes original-group
   cleanup and reports limitations` proves that unavailable discovery reports a
   limitation while retaining group cleanup; `README.md` documents that Linux
