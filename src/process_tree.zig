@@ -55,6 +55,16 @@ pub const GroupMember = struct {
     live: bool,
 };
 
+/// A platform walker reports either a usable member, a process which
+/// disappeared between enumeration and inspection, or an operational failure.
+/// The latter must remain distinct: treating it as disappearance could falsely
+/// prove the original group is empty.
+const GroupMembershipWalkEntry = union(enum) {
+    member: GroupMember,
+    disappeared,
+    unavailable,
+};
+
 /// Classifies a completed process-group membership walk. The child leader is
 /// intentionally excluded because the caller holds its zombie as the PGID
 /// reservation; any other live member requires teardown.
@@ -66,6 +76,29 @@ pub fn classifyGroupMembership(
     for (members) |member| {
         if (member.pid != reserved_zombie_pid and member.pgid == child_pgid and member.live) {
             return .live;
+        }
+    }
+    return .none;
+}
+
+/// Classifies an entire membership walk. This is the pure seam shared by the
+/// platform walkers so test cases can inject races and operating failures.
+fn classifyGroupMembershipWalk(
+    entries: []const GroupMembershipWalkEntry,
+    reserved_zombie_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+) GroupMembership {
+    for (entries) |entry| {
+        switch (entry) {
+            .member => |member| {
+                if (classifyGroupMembership(&.{member}, reserved_zombie_pid, child_pgid) == .live) {
+                    return .live;
+                }
+            },
+            .disappeared => {},
+            // A table walk that cannot inspect a PID cannot prove it is not a
+            // live group member. The caller's conservative drain path owns it.
+            .unavailable => return .unknown,
         }
     }
     return .none;
@@ -370,7 +403,8 @@ pub fn captureAll(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocat
 
 /// Enumerates current process-group membership without attempting to prove any
 /// PPID ancestry. Per-process disappearance during the walk is a dead entry;
-/// inability to enumerate the process table itself is the only unknown result.
+/// any failure that cannot positively establish disappearance makes the answer
+/// unknown so callers take the conservative drain path.
 pub fn groupMembership(
     allocator: std.mem.Allocator,
     reserved_zombie_pid: posix.pid_t,
@@ -499,16 +533,49 @@ fn groupMembershipLinux(
         const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
         if (pid <= 0) continue;
 
-        var process = proc.openDir(entry.name, .{ .iterate = true }) catch continue;
-        defer process.close();
-        const stat = readLinuxStatWithState(process) catch continue orelse continue;
-        if (classifyGroupMembership(&.{.{
-            .pid = stat.record.identity.pid,
-            .pgid = stat.record.pgid,
-            .live = stat.state != 'Z',
-        }}, reserved_zombie_pid, child_pgid) == .live) return .live;
+        switch (classifyGroupMembershipWalk(
+            &.{linuxGroupMembershipEntry(proc, entry.name)},
+            reserved_zombie_pid,
+            child_pgid,
+        )) {
+            .live => return .live,
+            .unknown => return .unknown,
+            .none => {},
+        }
     }
     return .none;
+}
+
+fn linuxGroupMembershipEntry(proc: std.fs.Dir, name: []const u8) GroupMembershipWalkEntry {
+    var process = proc.openDir(name, .{ .iterate = true }) catch |err| {
+        return linuxGroupMembershipEntryFromError(err);
+    };
+    defer process.close();
+
+    var stat = process.openFile("stat", .{}) catch |err| {
+        return linuxGroupMembershipEntryFromError(err);
+    };
+    defer stat.close();
+    var buffer: [4096]u8 = undefined;
+    const bytes = stat.readAll(&buffer) catch |err| {
+        return linuxGroupMembershipEntryFromError(err);
+    };
+    const parsed = parseLinuxStatWithState(buffer[0..bytes]) orelse return .unavailable;
+    return .{ .member = .{
+        .pid = parsed.record.identity.pid,
+        .pgid = parsed.record.pgid,
+        .live = parsed.state != 'Z',
+    } };
+}
+
+/// Linux only documents ENOENT and ESRCH as expected process disappearance
+/// races at this seam. Permissions, descriptor exhaustion, short reads, and
+/// every other operating error leave the liveness answer unavailable.
+fn linuxGroupMembershipEntryFromError(err: anyerror) GroupMembershipWalkEntry {
+    return switch (err) {
+        error.FileNotFound, error.ProcessNotFound => .disappeared,
+        else => .unavailable,
+    };
 }
 
 fn captureLinux(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator.Error)!Snapshot {
@@ -781,8 +848,15 @@ fn groupMembershipDarwin(
         }
         for (pids[0..actual]) |pid| {
             if (pid <= 0) continue;
-            const member = captureDarwinGroupMember(pid) orelse continue;
-            if (classifyGroupMembership(&.{member}, reserved_zombie_pid, child_pgid) == .live) return .live;
+            switch (classifyGroupMembershipWalk(
+                &.{darwinGroupMembershipEntry(pid)},
+                reserved_zombie_pid,
+                child_pgid,
+            )) {
+                .live => return .live,
+                .unknown => return .unknown,
+                .none => {},
+            }
         }
         return .none;
     }
@@ -873,16 +947,24 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
     };
 }
 
-fn captureDarwinGroupMember(pid: posix.pid_t) ?GroupMember {
-    if (comptime builtin.os.tag != .macos) return null;
+fn darwinGroupMembershipEntry(pid: posix.pid_t) GroupMembershipWalkEntry {
+    if (comptime builtin.os.tag != .macos) return .unavailable;
     var info: ProcBsdInfo = undefined;
     const returned = proc_pidinfo(pid, proc_pidtbsdinfo, 0, @ptrCast(&info), @sizeOf(ProcBsdInfo));
-    if (returned != @sizeOf(ProcBsdInfo) or info.pid != @as(u32, @intCast(pid))) return null;
-    return .{
+    if (returned != @sizeOf(ProcBsdInfo)) return darwinGroupMembershipEntryFromShortRead(returned);
+    if (info.pid != @as(u32, @intCast(pid))) return .unavailable;
+    return .{ .member = .{
         .pid = pid,
         .pgid = @intCast(info.pgid),
         .live = info.status != proc_status_zombie,
-    };
+    } };
+}
+
+/// This pure classification makes the short-read safety rule testable without
+/// invoking libproc. Its zero-byte result positively reports that the listed
+/// PID disappeared; every other short result remains unavailable.
+fn darwinGroupMembershipEntryFromShortRead(returned: c_int) GroupMembershipWalkEntry {
+    return if (returned == 0) .disappeared else .unavailable;
 }
 
 /// The preliminary child read supplies only a parent lead. The record returned
@@ -1218,6 +1300,62 @@ test "group membership is independent from ancestry completeness" {
         .{ .pid = 71, .pgid = 70, .live = true },
     };
     try std.testing.expectEqual(GroupMembership.live, classifyGroupMembership(&live_member, 70, 70));
+}
+
+test "group membership walk distinguishes disappearance from unavailable entries" {
+    const Case = struct {
+        name: []const u8,
+        entries: []const GroupMembershipWalkEntry,
+        expected: GroupMembership,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "ESRCH and ENOENT are skipped when every member is dead",
+            .entries = &.{
+                linuxGroupMembershipEntryFromError(error.ProcessNotFound),
+                linuxGroupMembershipEntryFromError(error.FileNotFound),
+                .{ .member = .{ .pid = 70, .pgid = 70, .live = false } },
+            },
+            .expected = .none,
+        },
+        .{
+            .name = "disappearance is skipped before a live member",
+            .entries = &.{
+                linuxGroupMembershipEntryFromError(error.FileNotFound),
+                .{ .member = .{ .pid = 71, .pgid = 70, .live = true } },
+            },
+            .expected = .live,
+        },
+        .{
+            .name = "EMFILE makes an otherwise dead walk unknown",
+            .entries = &.{
+                .{ .member = .{ .pid = 70, .pgid = 70, .live = false } },
+                linuxGroupMembershipEntryFromError(error.ProcessFdQuotaExceeded),
+            },
+            .expected = .unknown,
+        },
+        .{
+            .name = "unexpected Linux error makes an otherwise dead walk unknown",
+            .entries = &.{
+                .{ .member = .{ .pid = 70, .pgid = 70, .live = false } },
+                linuxGroupMembershipEntryFromError(error.InputOutput),
+            },
+            .expected = .unknown,
+        },
+        .{
+            .name = "Darwin short read without positive gone indication is unknown",
+            .entries = &.{
+                .{ .member = .{ .pid = 70, .pgid = 70, .live = false } },
+                darwinGroupMembershipEntryFromShortRead(@sizeOf(ProcBsdInfo) - 1),
+            },
+            .expected = .unknown,
+        },
+    };
+
+    for (cases) |case| {
+        errdefer std.log.err("group membership case failed: {s}", .{case.name});
+        try std.testing.expectEqual(case.expected, classifyGroupMembershipWalk(case.entries, 70, 70));
+    }
 }
 
 test "linux public captureIdentity path compiles" {

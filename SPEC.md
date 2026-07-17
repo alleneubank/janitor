@@ -381,7 +381,8 @@ the original child process group.
 - REQ-JANITOR-021, REQ-JANITOR-022, REQ-JANITOR-023:
   `src/process_tree.zig` identity-validation, PID-reuse, bounded-resweep,
   incomplete-discovery, unrelated-process-exclusion, and `parent identity
-  binding rejects recycled parent slots` table-driven unit coverage; Linux-native
+  binding rejects recycled parent slots` and `group membership walk distinguishes
+  disappearance from unavailable entries` table-driven unit coverage; Linux-native
   `native current-process target liveness uses retained linux handle` coverage;
   plus
   `src/root.zig` `discovery plan executes original-group cleanup and reports
