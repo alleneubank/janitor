@@ -385,12 +385,18 @@ the original child process group.
   incomplete/capture-failure diagnostics, and `stale descendant identity from
   completed discovery is diagnosed`, which captures the stale-identity
   diagnostic from the production reporter.
+- REQ-JANITOR-022: compiled-binary `src/e2e.zig`
+  `testWatchPathTermEscapeDescendant` proves a descendant captured in the
+  original group can call `setsid()` from its TERM handler, be rediscovered
+  from its retained identity during the bounded resweep, and be individually
+  drained after the original group dies.
 - REQ-JANITOR-026: `src/root.zig` `discovery plan executes original-group
   cleanup and reports limitations` proves that unavailable discovery reports a
   limitation while retaining group cleanup; `README.md` documents that Linux
   and macOS are the only advertised snapshot-drain platforms and that other
   BSD platforms remain group-only and stop numeric group signals after reaping
-  a child leader. `nix develop -c zig build
-  -Dtarget=x86_64-linux` type-checks the supported Linux implementation. No
-  native BSD snapshot-drain verifier exists because BSD is deliberately not an
-  advertised descendant-drain platform.
+  a child leader. `nix develop -c zig build -Dtarget=x86_64-linux`,
+  `-Dtarget=x86_64-freebsd`, and `-Dtarget=x86_64-netbsd` compile-check the
+  platform backends; Linux e2e runs natively, while FreeBSD and NetBSD are not
+  native-verified here because they are deliberately not advertised
+  descendant-drain platforms.

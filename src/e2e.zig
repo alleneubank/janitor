@@ -30,6 +30,9 @@ pub fn main() !void {
     if (args.len == 3 and std.mem.eql(u8, args[1], "--detached-fixture")) {
         return runDetachedFixture(args[2]);
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--term-escape-fixture")) {
+        return runTermEscapeFixture(args[2]);
+    }
 
     if (args.len != 2) {
         std.debug.print("usage: e2e <janitor-exe>\n", .{});
@@ -50,6 +53,7 @@ pub fn main() !void {
     try testInteractiveForegroundHandoff(allocator, janitor_exe);
     try testWatchPathDetachedDescendant(allocator, janitor_exe, e2e_exe, false);
     try testWatchPathDetachedDescendant(allocator, janitor_exe, e2e_exe, true);
+    try testWatchPathTermEscapeDescendant(allocator, janitor_exe, e2e_exe);
 }
 
 // This fixture intentionally lives in the e2e executable rather than Janitor:
@@ -103,6 +107,53 @@ fn runDetachedFixture(control_path: []const u8) !void {
 
 fn ignoreSignal(_: c_int) callconv(.c) void {}
 
+// This reproduces the narrow snapshot-to-signal race: the forked member is
+// captured while it belongs to Janitor's original group, then the group's TERM
+// invokes its handler and it creates a new session. The group leader dies, so
+// only the bounded resweep can find the still-matching member for KILL.
+fn runTermEscapeFixture(control_path: []const u8) !void {
+    const member_pid = try posix.fork();
+    if (member_pid == 0) {
+        const control_fd = connectFixtureControl(control_path, fixture_timeout_ms) catch |err| {
+            std.debug.print("term-escape fixture control connection failed: {s}\n", .{@errorName(err)});
+            posix.exit(94);
+        };
+        defer posix.close(control_fd);
+
+        var escape_term = std.mem.zeroes(posix.Sigaction);
+        escape_term.handler = .{ .handler = escapeGroupOnTerm };
+        escape_term.mask = posix.sigemptyset();
+        posix.sigaction(posix.SIG.TERM, &escape_term, null);
+
+        var pid_buf: [64]u8 = undefined;
+        const pid_contents = std.fmt.bufPrint(&pid_buf, "{d}\n", .{std.c.getpid()}) catch posix.exit(95);
+        sendControlMessage(control_fd, pid_contents, fixture_timeout_ms) catch |err| {
+            std.debug.print("term-escape fixture readiness send failed: {s}\n", .{@errorName(err)});
+            posix.exit(96);
+        };
+
+        waitForTermEscapeCleanup(control_fd) catch |err| {
+            std.debug.print("term-escape fixture control wait failed: {s}\n", .{@errorName(err)});
+            posix.exit(97);
+        };
+        return;
+    }
+
+    // This direct child remains group leader and deliberately has the default
+    // SIGTERM disposition. Its exit makes old-group liveness false exactly
+    // when the escaped member needs the resweep.
+    while (true) std.Thread.sleep(std.time.ns_per_s);
+}
+
+var term_escape_requested = std.atomic.Value(bool).init(false);
+
+fn escapeGroupOnTerm(_: c_int) callconv(.c) void {
+    // The handler only publishes the request. `setsid` executes in normal
+    // control flow below, so an interrupted poll cannot accidentally end the
+    // fixture before it proves the post-TERM escape race.
+    term_escape_requested.store(true, .release);
+}
+
 // REQ-JANITOR-017 through REQ-JANITOR-020: default teardown drains a live
 // detached descendant, while the explicit `--pgroup-only` policy leaves that
 // same identity-connected sentinel outside Janitor's drain set.
@@ -112,9 +163,45 @@ fn testWatchPathDetachedDescendant(
     e2e_exe: []const u8,
     pgroup_only: bool,
 ) !void {
+    return testWatchPathControlledDescendant(
+        allocator,
+        janitor_exe,
+        e2e_exe,
+        "--detached-fixture",
+        pgroup_only,
+        "detached-descendant",
+    );
+}
+
+// REQ-JANITOR-022: a descendant that was in the original group at snapshot
+// time can escape *because of* the initial TERM. Default teardown resweeps its
+// captured identity, rediscovers the new individual target, and drains it.
+fn testWatchPathTermEscapeDescendant(
+    allocator: std.mem.Allocator,
+    janitor_exe: []const u8,
+    e2e_exe: []const u8,
+) !void {
+    return testWatchPathControlledDescendant(
+        allocator,
+        janitor_exe,
+        e2e_exe,
+        "--term-escape-fixture",
+        false,
+        "term-escape-descendant",
+    );
+}
+
+fn testWatchPathControlledDescendant(
+    allocator: std.mem.Allocator,
+    janitor_exe: []const u8,
+    e2e_exe: []const u8,
+    fixture_arg: []const u8,
+    pgroup_only: bool,
+    test_name: []const u8,
+) !void {
     var sandbox = try Sandbox.init(
         allocator,
-        if (pgroup_only) "detached-pgroup-only" else "detached-descendant",
+        if (pgroup_only) "detached-pgroup-only" else test_name,
     );
     defer sandbox.deinit();
 
@@ -140,7 +227,7 @@ fn testWatchPathDetachedDescendant(
         "20",
     });
     if (pgroup_only) try arguments.append(allocator, "--pgroup-only");
-    try arguments.appendSlice(allocator, &.{ "--", e2e_exe, "--detached-fixture", control_path });
+    try arguments.appendSlice(allocator, &.{ "--", e2e_exe, fixture_arg, control_path });
 
     var janitor = std.process.Child.init(arguments.items, allocator);
     janitor.stdin_behavior = .Ignore;
@@ -167,9 +254,13 @@ fn testWatchPathDetachedDescendant(
     std.debug.print("detached fixture connected (diagnostic pid {d})\n", .{diagnostic_pid});
 
     try std.fs.cwd().deleteFile(watch_path);
-    const janitor_term = try waitForChildTerm(&janitor, 3000, "detached-descendant teardown");
+    const janitor_term = try waitForChildTerm(&janitor, 3000, test_name);
     janitor_reaped = true;
-    try expectExited(janitor_term, 128 + posix.SIG.TERM, "detached-descendant teardown preserves direct child status");
+    try expectExited(
+        janitor_term,
+        128 + posix.SIG.TERM,
+        "controlled descendant teardown preserves direct child status",
+    );
 
     if (pgroup_only) {
         try std.testing.expectError(error.Timeout, control.waitForExit(250));
@@ -177,7 +268,7 @@ fn testWatchPathDetachedDescendant(
         control_cleanup_required = false;
     } else {
         control.waitForExit(fixture_timeout_ms) catch |err| {
-            std.debug.print("connected detached descendant survived default Janitor teardown\n", .{});
+            std.debug.print("connected {s} survived default Janitor teardown\n", .{test_name});
             return err;
         };
         control_cleanup_required = false;
@@ -771,6 +862,35 @@ fn waitForFixtureCleanup(fd: posix.fd_t) !void {
     }};
     while (true) {
         _ = try posix.poll(&poll_fds, -1);
+        const events = poll_fds[0].revents;
+        poll_fds[0].revents = 0;
+        if (events & posix.POLL.NVAL != 0) return error.ControlConnectionFailed;
+        if (events & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
+
+        var byte: [1]u8 = undefined;
+        const received = posix.recv(fd, &byte, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+        if (received == 0 or byte[0] == 'C') return;
+        return error.UnexpectedFixtureControlData;
+    }
+}
+
+fn waitForTermEscapeCleanup(fd: posix.fd_t) !void {
+    var escaped = false;
+    var poll_fds = [1]posix.pollfd{.{
+        .fd = fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    while (true) {
+        if (!escaped and term_escape_requested.load(.acquire)) {
+            _ = try posix.setsid();
+            escaped = true;
+        }
+        _ = try posix.poll(&poll_fds, 50);
         const events = poll_fds[0].revents;
         poll_fds[0].revents = 0;
         if (events & posix.POLL.NVAL != 0) return error.ControlConnectionFailed;

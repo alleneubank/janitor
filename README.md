@@ -170,6 +170,11 @@ Linux can be typechecked from macOS with:
 zig build -Dtarget=x86_64-linux
 ```
 
+The FreeBSD and NetBSD group-only backends are compile-verified with
+`-Dtarget=x86_64-freebsd` and `-Dtarget=x86_64-netbsd`. Their native process
+semantics are not part of this Linux e2e suite; snapshot descendant draining is
+advertised and native-tested only on Linux and macOS.
+
 ## Release Notes For Maintainers
 
 Janitor's release archives target hash-verifying CLI installers and package

@@ -287,14 +287,34 @@ fn teardownWithDiagnostics(
         if (event == .timeout) break;
     }
 
-    var sent_kill = false;
-    if (drainSetAlive(&drain_set, allocator, child_pgid, child_state, diagnostics)) {
+    // Resweep before deciding whether escalation is needed. An initially
+    // in-group target can call setsid() in response to the group TERM: after
+    // the leader exits, the old group is gone but that captured identity is
+    // still a valid individual target only the resweep can rediscover.
+    if (drain_set.captured.items.len != 0) {
         drain_set.resweep(allocator) catch |err| {
             std.log.warn(
                 "descendant resweep unavailable ({s}); forcing only verified captured targets",
                 .{@errorName(err)},
             );
         };
+    }
+    // A process can disappear from the second process-table enumeration while
+    // its retained Linux handle still proves it is the captured identity. If
+    // the original group is already dead, such a live captured target must
+    // have escaped it; publish that exact capability for individual draining.
+    if (!originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*)) {
+        drain_set.original_group_dead = true;
+        drain_set.promoteLiveCapturedTargets(allocator) catch |err| {
+            std.log.warn(
+                "could not retain live captured descendants after resweep ({s})",
+                .{@errorName(err)},
+            );
+        };
+    }
+
+    var sent_kill = false;
+    if (drainSetAlive(&drain_set, allocator, child_pgid, child_state, diagnostics)) {
         sent_kill = signalDrainSet(&drain_set, child_pgid, child_state, posix.SIG.KILL, diagnostics);
     }
 
@@ -359,6 +379,35 @@ const TeardownSequence = struct {
         return self.actions[index];
     }
 };
+
+/// Once a backend has reaped the child leader, its former numeric PGID might
+/// already name an unrelated process group. This gate must precede every
+/// numeric PGID probe as well as every group signal.
+fn numericGroupSignalsAllowed(reservation_held: bool, child_reaped: bool) bool {
+    return reservation_held or !child_reaped;
+}
+
+const ForcedTeardownPlan = struct {
+    resweep: bool,
+    signal_original_group: bool,
+    signal_escaped_targets: bool,
+};
+
+/// The bounded resweep is mandatory whenever the initial snapshot captured
+/// targets, before liveness decides whether KILL is necessary. Keeping this
+/// order pure makes the TERM-to-setsid race independently testable.
+fn forcedTeardownPlan(
+    snapshot_captured_targets: bool,
+    original_group_alive: bool,
+    original_group_dead: bool,
+) ForcedTeardownPlan {
+    const action = drainSignalAction(.{}, original_group_alive, original_group_dead);
+    return .{
+        .resweep = snapshot_captured_targets,
+        .signal_original_group = action.signal_original_group,
+        .signal_escaped_targets = action.signal_escaped_targets,
+    };
+}
 
 fn teardownSequence(
     reservation_held: bool,
@@ -570,7 +619,28 @@ const DrainSet = struct {
         );
         self.reswept = snapshot;
     }
+
+    /// After the original group dies, a live capability captured from that
+    /// group can only name an escaped process. This covers a TERM handler that
+    /// calls setsid() and is reparented before the resweep's numeric scan can
+    /// read it, without authorizing any PID that was not captured initially.
+    fn promoteLiveCapturedTargets(self: *DrainSet, allocator: std.mem.Allocator) !void {
+        const initial = self.initial orelse return;
+        for (initial.targets) |target| {
+            if (!containsCapturedIdentity(self.captured.items, target.record().identity)) continue;
+            if (target.liveness() != .live) continue;
+            try appendUniqueTarget(allocator, &self.escaped, target);
+        }
+    }
 };
+
+fn containsCapturedIdentity(
+    captured: []const process_tree.ProcessRecord,
+    identity: process_tree.ProcessIdentity,
+) bool {
+    for (captured) |record| if (record.identity.eql(identity)) return true;
+    return false;
+}
 
 /// Resweep targets remain owned by `snapshot` until the entire publication is
 /// guaranteed infallible. This prevents an allocation failure from leaving
@@ -755,14 +825,19 @@ fn teardownGroupOnly(
 ) u8 {
     var sent_term = false;
     var sent_kill = false;
-    if (isProcessGroupAlive(child_pgid)) {
+    // This gate intentionally comes before the first liveness probe. BSD
+    // kqueue has already reaped a child-exit event, so even probe-only use of
+    // the numeric PGID could observe a recycled unrelated group.
+    if (numericGroupSignalsAllowed(childPgidReservationHeld(), child_state.* == .reaped) and
+        isProcessGroupAlive(child_pgid))
+    {
         executeDiscoveryPlan(plan, child_pgid, posix.SIG.TERM, signalProcessGroup);
         sent_term = true;
 
         const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
         while (monotonicNowNs() < deadline_ns) {
             _ = tryPollChild(child_pid, child_state);
-            if (!childPgidReservationHeld() and child_state.* == .reaped) {
+            if (!numericGroupSignalsAllowed(childPgidReservationHeld(), child_state.* == .reaped)) {
                 if (writeDiagnostic(
                     "janitor: child leader was reaped; skipping further process-group signals to avoid PGID reuse\n",
                     diagnostics,
@@ -778,7 +853,7 @@ fn teardownGroupOnly(
             if (event == .timeout) break;
         }
 
-        if (childPgidReservationHeld() or child_state.* != .reaped) {
+        if (numericGroupSignalsAllowed(childPgidReservationHeld(), child_state.* == .reaped)) {
             if (isProcessGroupAlive(child_pgid)) {
                 executeDiscoveryPlan(plan, child_pgid, posix.SIG.KILL, signalProcessGroup);
                 sent_kill = true;
@@ -1240,7 +1315,13 @@ const KqueueWatcher = struct {
     fn addPath(self: *KqueueWatcher, path: []const u8) !void {
         if (!pathExists(path)) return error.FileNotFound;
 
-        const fd = try posix.open(path, .{ .ACCMODE = .RDONLY, .EVTONLY = true, .CLOEXEC = true }, 0);
+        const open_flags: posix.O = if (comptime builtin.os.tag == .macos)
+            .{ .ACCMODE = .RDONLY, .EVTONLY = true, .CLOEXEC = true }
+        else
+            // EVTONLY is a Darwin-only extension. Other kqueue platforms use
+            // the portable read-only descriptor for EVFILT_VNODE.
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+        const fd = try posix.open(path, open_flags, 0);
         errdefer posix.close(fd);
 
         try self.addKevent(
@@ -1547,6 +1628,24 @@ test "drain signal action latches a dead group while retaining escaped targets" 
     try std.testing.expect(live_group.signal_original_group);
     try std.testing.expect(live_group.signal_escaped_targets);
     try std.testing.expect(!live_group.original_group_dead);
+}
+
+test "reaped non-reservation leader suppresses the initial numeric group probe" {
+    // FreeBSD/NetBSD child-exit observation consumes the group leader. The
+    // fallback must not even test that numeric PGID before declining TERM.
+    try std.testing.expect(!numericGroupSignalsAllowed(false, true));
+    try std.testing.expect(numericGroupSignalsAllowed(false, false));
+    try std.testing.expect(numericGroupSignalsAllowed(true, true));
+}
+
+test "forced teardown resweeps an in-group capture that escapes after TERM" {
+    // The group died with its leader, but the snapshot had captured a member
+    // that is still live after it called setsid() from its TERM handler. The
+    // planner resweeps first and then retains only individual draining.
+    const action = forcedTeardownPlan(true, false, true);
+    try std.testing.expect(action.resweep);
+    try std.testing.expect(!action.signal_original_group);
+    try std.testing.expect(action.signal_escaped_targets);
 }
 
 test "teardown reaps after every numeric group signal" {
