@@ -17,6 +17,9 @@ pub const version = build_info.version;
 /// a git checkout (e.g. from a release source tarball).
 pub const git_sha = build_info.git_sha;
 
+/// Build-target capability exposed for the executable's platform-accurate help.
+pub const descendants_supported = process_tree.descendants_supported;
+
 /// REQ-JANITOR-015: formats the version banner ("janitor <version> (<sha>)")
 /// into `buf` and returns the written slice (no trailing newline). Buffer-based
 /// rather than writer-based so the executable's stdout path and the unit test
@@ -59,8 +62,17 @@ pub const RunError = error{
 
 const ChildState = union(enum) {
     running,
-    exited: u32,
+    /// The direct child remains a zombie after this status is observed. Since
+    /// it is also the process-group leader, that retains `child_pgid` until
+    /// every numeric process-group operation has finished.
+    observed: u8,
+    reaped: u8,
 };
+
+// Zig 0.15 exposes Linux's waitid syscall but not the libc wrapper. Darwin
+// provides the POSIX function; use its ABI types directly until std.posix
+// grows that wrapper.
+extern "c" fn waitid(idtype: c_uint, id: c_uint, info: *posix.siginfo_t, options: c_int) c_int;
 
 const TeardownReason = enum {
     parent_exited,
@@ -204,7 +216,7 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
                     return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .child_exited);
                 }
 
-                return encodeStatus(child_state.exited);
+                return reapChild(child_pid, &child_state);
             },
             .timeout => unreachable,
         }
@@ -257,7 +269,7 @@ fn teardownWithDiagnostics(
     defer drain_set.deinit(allocator);
 
     reportDiscoveryPlan(diagnostics, drain_set.plan, null);
-    signalDrainSet(&drain_set, child_pgid, posix.SIG.TERM, diagnostics);
+    const sent_term = signalDrainSet(&drain_set, child_pgid, posix.SIG.TERM, diagnostics);
 
     const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
     while (monotonicNowNs() < deadline_ns) {
@@ -270,6 +282,7 @@ fn teardownWithDiagnostics(
         if (event == .timeout) break;
     }
 
+    var sent_kill = false;
     if (drainSetAlive(&drain_set, child_pgid, diagnostics)) {
         drain_set.resweep(allocator) catch |err| {
             std.log.warn(
@@ -277,7 +290,7 @@ fn teardownWithDiagnostics(
                 .{@errorName(err)},
             );
         };
-        signalDrainSet(&drain_set, child_pgid, posix.SIG.KILL, diagnostics);
+        sent_kill = signalDrainSet(&drain_set, child_pgid, posix.SIG.KILL, diagnostics);
     }
 
     while (child_state.* == .running) {
@@ -286,10 +299,7 @@ fn teardownWithDiagnostics(
         _ = watcher.wait(null) catch break;
     }
 
-    return switch (child_state.*) {
-        .running => 128 + posix.SIG.KILL,
-        .exited => |status| encodeStatus(status),
-    };
+    return reapAfterTeardown(child_pid, child_state, teardownSequence(sent_term, sent_kill));
 }
 
 /// Teardown always retains the original child group. Discovery can only add
@@ -323,6 +333,36 @@ const DrainSignalAction = struct {
     signal_escaped_targets: bool,
     original_group_dead: bool,
 };
+
+/// The pure completion seam records every numeric process-group signal before
+/// the one real reap. Keeping it in production code makes the reservation
+/// ordering independently testable across all teardown routes.
+const TeardownAction = enum { signal_term, signal_kill, reap };
+
+const TeardownSequence = struct {
+    actions: [3]TeardownAction = undefined,
+    len: usize,
+
+    fn at(self: TeardownSequence, index: usize) TeardownAction {
+        std.debug.assert(index < self.len);
+        return self.actions[index];
+    }
+};
+
+fn teardownSequence(sent_term: bool, sent_kill: bool) TeardownSequence {
+    var sequence: TeardownSequence = .{ .len = 0 };
+    if (sent_term) {
+        sequence.actions[sequence.len] = .signal_term;
+        sequence.len += 1;
+    }
+    if (sent_kill) {
+        sequence.actions[sequence.len] = .signal_kill;
+        sequence.len += 1;
+    }
+    sequence.actions[sequence.len] = .reap;
+    sequence.len += 1;
+    return sequence;
+}
 
 /// Decides the exact production signal set from an immediate group-liveness
 /// observation. Individual capabilities remain safe after the original group
@@ -590,7 +630,7 @@ fn signalDrainSet(
     child_pgid: posix.pid_t,
     signal: u8,
     diagnostics: *std.Io.Writer,
-) void {
+) bool {
     const action = drainSignalAction(
         drain_set.plan,
         isProcessGroupAlive(child_pgid),
@@ -607,6 +647,7 @@ fn signalDrainSet(
             reportTargetDecision(diagnostics, targetDecision(target.signal(signal)), "individual signal");
         }
     }
+    return action.signal_original_group;
 }
 
 fn drainSetAlive(drain_set: *DrainSet, child_pgid: posix.pid_t, diagnostics: *std.Io.Writer) bool {
@@ -635,8 +676,11 @@ fn teardownGroupOnly(
     watcher: *Watcher,
     child_state: *ChildState,
 ) u8 {
+    var sent_term = false;
+    var sent_kill = false;
     if (isProcessGroupAlive(child_pgid)) {
         executeDiscoveryPlan(plan, child_pgid, posix.SIG.TERM, signalProcessGroup);
+        sent_term = true;
 
         const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
         while (monotonicNowNs() < deadline_ns) {
@@ -651,6 +695,7 @@ fn teardownGroupOnly(
 
         if (isProcessGroupAlive(child_pgid)) {
             executeDiscoveryPlan(plan, child_pgid, posix.SIG.KILL, signalProcessGroup);
+            sent_kill = true;
         }
     }
 
@@ -660,19 +705,109 @@ fn teardownGroupOnly(
         _ = watcher.wait(null) catch break;
     }
 
-    return switch (child_state.*) {
-        .running => 128 + posix.SIG.KILL,
-        .exited => |status| encodeStatus(status),
-    };
+    return reapAfterTeardown(child_pid, child_state, teardownSequence(sent_term, sent_kill));
 }
 
 fn tryPollChild(child_pid: posix.pid_t, child_state: *ChildState) bool {
     if (child_state.* != .running) return true;
 
-    const result = posix.waitpid(child_pid, posix.W.NOHANG);
-    if (result.pid == 0) return false;
-    child_state.* = .{ .exited = result.status };
+    const status = observeChild(child_pid) orelse return false;
+    child_state.* = .{ .observed = status };
     return true;
+}
+
+/// Observes, but never consumes, the direct child's exit. Holding that zombie
+/// is what makes signaling `-child_pgid` safe: a process group leader's PID
+/// cannot be recycled before it is reaped.
+fn observeChild(child_pid: posix.pid_t) ?u8 {
+    return switch (builtin.os.tag) {
+        .linux => observeChildLinux(child_pid),
+        .macos, .ios, .tvos, .watchos, .visionos => observeChildDarwin(child_pid),
+        // The remaining supported BSD watcher targets do not offer WNOWAIT
+        // through their current platform ABI. They retain the dead-group latch
+        // and group-only behavior documented by REQ-JANITOR-026, but cannot
+        // claim this stronger PGID-reservation guarantee.
+        else => observeChildWithoutReservation(child_pid),
+    };
+}
+
+fn observeChildLinux(child_pid: posix.pid_t) ?u8 {
+    const linux = std.os.linux;
+    while (true) {
+        var info = std.mem.zeroes(linux.siginfo_t);
+        const rc = linux.waitid(.PID, child_pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            .CHILD => return null,
+            else => return null,
+        }
+        if (info.signo == 0) return null;
+        return childStatusFromSiginfo(info.code, info.fields.common.second.sigchld.status);
+    }
+}
+
+fn observeChildDarwin(child_pid: posix.pid_t) ?u8 {
+    while (true) {
+        var info = std.mem.zeroes(posix.siginfo_t);
+        const rc = waitid(1, @intCast(child_pid), &info, 0x00000004 | 0x00000001 | 0x00000020);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            .CHILD => return null,
+            else => return null,
+        }
+        if (info.signo == 0) return null;
+        return childStatusFromSiginfo(info.code, info.status);
+    }
+}
+
+fn observeChildWithoutReservation(child_pid: posix.pid_t) ?u8 {
+    const result = posix.waitpid(child_pid, posix.W.NOHANG);
+    if (result.pid == 0) return null;
+    return encodeStatus(result.status);
+}
+
+/// POSIX CLD_EXITED, CLD_KILLED, and CLD_DUMPED respectively. `waitid`
+/// reports the same terminal outcome as `waitpid`, just without reaping it.
+fn childStatusFromSiginfo(code: c_int, status: c_int) u8 {
+    return switch (code) {
+        1 => @intCast(status),
+        2, 3 => @intCast(@min(@as(c_int, 255), 128 + status)),
+        else => 128,
+    };
+}
+
+/// Performs Janitor's one real reap after all process-group signaling and
+/// probing. For WNOWAIT platforms the status was latched earlier; `waitpid`
+/// here exists only to release the zombie and must agree with that latch.
+fn reapChild(child_pid: posix.pid_t, child_state: *ChildState) u8 {
+    return switch (child_state.*) {
+        .reaped => |status| status,
+        .observed => |status| blk: {
+            _ = posix.waitpid(child_pid, 0);
+            child_state.* = .{ .reaped = status };
+            break :blk status;
+        },
+        .running => blk: {
+            const result = posix.waitpid(child_pid, 0);
+            const status = encodeStatus(result.status);
+            child_state.* = .{ .reaped = status };
+            break :blk status;
+        },
+    };
+}
+
+fn reapAfterTeardown(
+    child_pid: posix.pid_t,
+    child_state: *ChildState,
+    sequence: TeardownSequence,
+) u8 {
+    // No numeric process-group probe or signal may follow this reap: while
+    // the group leader is a zombie its PID reserves the PGID against reuse.
+    std.debug.assert(sequence.len > 0);
+    std.debug.assert(sequence.at(sequence.len - 1) == .reap);
+    return reapChild(child_pid, child_state);
 }
 
 pub fn encodeStatus(status: u32) u8 {
@@ -1274,6 +1409,35 @@ test "drain signal action latches a dead group while retaining escaped targets" 
     try std.testing.expect(live_group.signal_original_group);
     try std.testing.expect(live_group.signal_escaped_targets);
     try std.testing.expect(!live_group.original_group_dead);
+}
+
+test "teardown reaps after every numeric group signal" {
+    const cases = [_]struct {
+        name: []const u8,
+        sent_term: bool,
+        sent_kill: bool,
+    }{
+        .{ .name = "drain", .sent_term = true, .sent_kill = false },
+        .{ .name = "escalate", .sent_term = true, .sent_kill = true },
+        .{ .name = "discovery-failed", .sent_term = true, .sent_kill = true },
+        .{ .name = "pgroup-only", .sent_term = true, .sent_kill = true },
+        .{ .name = "child-self-exit", .sent_term = false, .sent_kill = false },
+    };
+
+    for (cases) |case| {
+        const sequence = teardownSequence(case.sent_term, case.sent_kill);
+        var reap_count: usize = 0;
+        for (0..sequence.len) |index| {
+            switch (sequence.at(index)) {
+                .reap => {
+                    reap_count += 1;
+                    try std.testing.expectEqual(sequence.len - 1, index);
+                },
+                .signal_term, .signal_kill => try std.testing.expectEqual(@as(usize, 0), reap_count),
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), reap_count);
+    }
 }
 
 test "resweep publication allocation failure leaves drain set valid" {

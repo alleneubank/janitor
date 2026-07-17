@@ -271,10 +271,11 @@ the original child process group.
 - [x] `zig build test` runs unit tests and the e2e process tests.
 - [x] `zig build fmt` passes.
 - [x] Supported platforms use kqueue/epoll event waits instead of idle polling.
-- [ ] Process-tree unit tests prove that an old descendant process-table record
+- [x] Process-tree unit tests prove that an old descendant process-table record
       whose numeric PID is recycled before stable-handle acquisition cannot add
       the unrelated replacement—even when the acquired stable handle names that
-      replacement—to the drain set.
+      replacement—to the drain set. (Verified by the `src/process_tree.zig`
+      unit suite.)
 - [ ] With a controlling terminal, the child process group becomes the
       terminal's foreground process group after spawn, and the original
       foreground process group is restored after teardown.
@@ -296,12 +297,15 @@ the original child process group.
       drains it with the full drain set.
 - [x] `--pgroup-only` retains process-group-only teardown and leaves an escaped
       descendant outside Janitor's drain set.
-- [ ] An identity mismatch or PID-reuse candidate is skipped and diagnosed;
-      the original group still drains.
-- [ ] Incomplete discovery is diagnosed without broadening individual signal
+- [x] An identity mismatch or PID-reuse candidate is skipped and diagnosed;
+      the original group still drains. (Verified by the unit and e2e suites.)
+- [x] Incomplete discovery is diagnosed without broadening individual signal
       targets, and bounded resweep admits only proven live descendants.
-- [ ] Acceptance evidence includes the unit and e2e suites executed natively
+      (Verified by the unit and e2e suites.)
+- [x] Acceptance evidence includes the unit and e2e suites executed natively
       on each advertised snapshot descendant-drain platform: macOS and Linux.
+      (macOS run recorded in traceability; Linux run recorded in
+      `.rl/results/native-linux-verify-d21bee5.md`.)
 
 ## Risk Classification
 
