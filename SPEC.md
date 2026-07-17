@@ -258,6 +258,15 @@ the original child process group.
   wait mechanism on supported event backends.
 - No recovery guarantee for ancestry already reparented before the teardown
   snapshot; it is not recoverable through a PPID snapshot alone.
+- No defense against a supervised process adversarially evading teardown, such
+  as `setpgid`-ing back into the zombie-led original group after an empty
+  membership observation and forking inside the teardown window. Janitor
+  supervises cooperative-but-messy processes; a descendant actively working
+  to escape cleanup is out of scope (ratified 2026-07-17).
+- Darwin group-membership enumeration may count an unreaped zombie member as
+  live because XNU's `proc_listpids` walks `zombproc` too. The error is in
+  the conservative direction only: an occasional unnecessary grace wait,
+  never a broadened signal set.
 - No claim that Darwin/BSD can atomically bind `kill(pid, signal)` to the
   captured start-time identity; their validation-to-`kill` TOCTOU is an
   unavoidable native-platform limit.

@@ -5,9 +5,10 @@
 Janitor supervision is shippable when teardown signals only its original child
 process group or descendants that pass the strongest platform identity
 verification: Linux binds the ancestry-proving process-table record to the
-stable handle used for liveness and signaling, while Darwin/BSD immediately
-revalidate `(pid, start_time)` before `kill(pid, signal)` with the residual
-validation-to-`kill` race explicitly acknowledged.
+stable handle used for liveness and signaling, while Darwin (macOS) immediately
+revalidates `(pid, start_time)` before `kill(pid, signal)` with the residual
+validation-to-`kill` race explicitly acknowledged. The retained kqueue BSDs
+(FreeBSD, OpenBSD, NetBSD, DragonFly) are group-only and say so.
 
 ## Dimensions
 
@@ -31,11 +32,13 @@ validation-to-`kill` race explicitly acknowledged.
   a stable process reference before reading the PPID, start-time, and PGID
   record that establishes ancestry, then uses that reference or a pidfd proven
   bound to the same record for liveness and signaling. A later `pidfd_open` of
-  an unbound numeric snapshot cannot satisfy this floor. Darwin/BSD capture
-  start time and immediately re-read `(pid, start_time)` before `kill(pid,
-  signal)`. Darwin/BSD's validation-to-`kill` TOCTOU is documented as a native
-  limit, not claimed away. An unsupported path is a fail-closed documentation
-  or implementation block, not a silent fallback.
+  an unbound numeric snapshot cannot satisfy this floor. Darwin (macOS)
+  captures start time and immediately re-reads `(pid, start_time)` before
+  `kill(pid, signal)`; its validation-to-`kill` TOCTOU is documented as a
+  native limit, not claimed away. The retained kqueue BSDs perform group-only
+  teardown and never claim individual descendant signaling. An unsupported
+  path is a fail-closed documentation or implementation block, not a silent
+  fallback.
 - Diagnostics tests prove incomplete discovery still drains the original group,
   reports the limitation, and never broadens individual signal targets.
 
@@ -52,9 +55,10 @@ oracle is the implementing agent's self-assessment.
   verification is mismatched, unavailable, or stale. On Linux, a stable handle
   acquired after an unbound numeric process-table record is insufficient: the
   handle must be linked to the exact record that proved ancestry, and a
-  replacement after PID recycling is rejected. Darwin/BSD must immediately
+  replacement after PID recycling is rejected. Darwin (macOS) must immediately
   re-read `(pid, start_time)` before `kill(pid, signal)` and must document the
-  unavoidable validation-to-`kill` TOCTOU.
+  unavoidable validation-to-`kill` TOCTOU. The retained kqueue BSDs never
+  signal individual descendants at all.
 - Never signal a process group other than the original group Janitor created.
 - Never let incomplete discovery block original-group cleanup, silently claim
   complete coverage, or broaden the signal set by guesswork.
@@ -68,13 +72,17 @@ oracle is the implementing agent's self-assessment.
 - Janitor snapshots the live PPID-linked closure before the first TERM; only the
   original child group is signaled wholesale.
 - Descendant drain is the default. `--pgroup-only` is the explicit escape hatch.
-- Linux uses pidfds as stable individual signal handles. Darwin/BSD capture
-  start time and immediately re-read `(pid, start_time)` before each
+- Linux uses pidfds as stable individual signal handles. Darwin (macOS)
+  captures start time and immediately re-reads `(pid, start_time)` before each
   `kill(pid, signal)`; that validation narrows but cannot atomically eliminate
-  the validation-to-`kill` TOCTOU.
+  the validation-to-`kill` TOCTOU. The retained kqueue BSDs are group-only.
 - Lifetime ownership is excluded: processes already reparented before the
   snapshot, continuous fork tracking, cgroups, and registries remain out of
   scope.
+- Adversarial evasion is excluded (ratified 2026-07-17): a supervised process
+  that actively re-enters the zombie-led original group via `setpgid` after an
+  empty membership observation and forks inside the teardown window is outside
+  the threat model; Janitor supervises cooperative-but-messy processes.
 
 ## Boundary
 
