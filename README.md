@@ -101,6 +101,10 @@ group.
 Snapshot descendant draining is supported on Linux and macOS. Other BSD
 platforms retain the original process-group-only teardown: Janitor reports that
 the descendant snapshot is unavailable and never guesses individual targets.
+Those BSD backends cannot observe a child exit without reaping its group
+leader. Once that happens Janitor stops issuing numeric process-group signals,
+because a recycled PGID could otherwise target an unrelated group; this
+deliberately favors signal safety over any remaining group cleanup breadth.
 
 The child command is started in a new process group. Janitor signals only that
 group wholesale; escaped descendants are individually addressed through their
@@ -143,6 +147,9 @@ configuration knobs.
   wrapper, so cleanup is impossible in that one case.
 - The exit status follows the direct child when available. Signal deaths are
   encoded as `128 + signal`.
+- On FreeBSD, OpenBSD, NetBSD, and DragonFly, a child exit observed during a
+  teardown may leave remaining original-group members undrained: Janitor has
+  already reaped the leader and will not risk signaling a recycled PGID.
 
 ## Build And Test
 

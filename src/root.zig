@@ -212,7 +212,11 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
             .signal => return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .signal),
             .child_exited => {
                 if (!tryPollChild(child_pid, &child_state)) continue;
-                if (isProcessGroupAlive(child_pgid)) {
+                // On Linux/Darwin the exited group leader is deliberately held
+                // as a zombie to reserve its PGID.  `kill(-pgid, 0)` therefore
+                // sees the reservation itself; only another live member makes
+                // this a real teardown.
+                if (originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state)) {
                     return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .child_exited);
                 }
 
@@ -264,17 +268,18 @@ fn teardownWithDiagnostics(
     var drain_set = DrainSet.init(allocator, config.drain_scope, child_pid, child_pgid) catch |err| {
         const plan = discoveryPlan(.capture_failed);
         reportDiscoveryPlan(diagnostics, plan, @errorName(err));
-        return teardownGroupOnly(plan, child_pid, child_pgid, config, watcher, child_state);
+        return teardownGroupOnly(plan, child_pid, child_pgid, config, watcher, child_state, diagnostics);
     };
     defer drain_set.deinit(allocator);
 
     reportDiscoveryPlan(diagnostics, drain_set.plan, null);
-    const sent_term = signalDrainSet(&drain_set, child_pgid, posix.SIG.TERM, diagnostics);
+    const sent_term = signalDrainSet(&drain_set, child_pgid, child_state, posix.SIG.TERM, diagnostics);
 
     const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
     while (monotonicNowNs() < deadline_ns) {
         _ = tryPollChild(child_pid, child_state);
-        if (!drainSetAlive(&drain_set, child_pgid, diagnostics)) break;
+        latchReapedUnreservedGroup(&drain_set, child_state, diagnostics);
+        if (!drainSetAlive(&drain_set, allocator, child_pgid, child_state, diagnostics)) break;
 
         const remaining_ms = remainingMs(deadline_ns);
         if (remaining_ms == 0) break;
@@ -283,14 +288,14 @@ fn teardownWithDiagnostics(
     }
 
     var sent_kill = false;
-    if (drainSetAlive(&drain_set, child_pgid, diagnostics)) {
+    if (drainSetAlive(&drain_set, allocator, child_pgid, child_state, diagnostics)) {
         drain_set.resweep(allocator) catch |err| {
             std.log.warn(
                 "descendant resweep unavailable ({s}); forcing only verified captured targets",
                 .{@errorName(err)},
             );
         };
-        sent_kill = signalDrainSet(&drain_set, child_pgid, posix.SIG.KILL, diagnostics);
+        sent_kill = signalDrainSet(&drain_set, child_pgid, child_state, posix.SIG.KILL, diagnostics);
     }
 
     while (child_state.* == .running) {
@@ -299,7 +304,13 @@ fn teardownWithDiagnostics(
         _ = watcher.wait(null) catch break;
     }
 
-    return reapAfterTeardown(child_pid, child_state, teardownSequence(sent_term, sent_kill));
+    const sequence = teardownSequence(
+        childPgidReservationHeld(),
+        child_state.* == .reaped,
+        sent_term,
+        sent_kill,
+    );
+    return reapAfterTeardown(child_pid, child_state, sequence);
 }
 
 /// Teardown always retains the original child group. Discovery can only add
@@ -349,11 +360,24 @@ const TeardownSequence = struct {
     }
 };
 
-fn teardownSequence(sent_term: bool, sent_kill: bool) TeardownSequence {
+fn teardownSequence(
+    reservation_held: bool,
+    child_reaped: bool,
+    sent_term: bool,
+    sent_kill: bool,
+) TeardownSequence {
     var sequence: TeardownSequence = .{ .len = 0 };
     if (sent_term) {
         sequence.actions[sequence.len] = .signal_term;
         sequence.len += 1;
+    }
+    // Platforms without WNOWAIT consume the leader while observing its status.
+    // After that reap, a numeric PGID can name an unrelated later group, so the
+    // production plan must suppress every later group signal.
+    if (!reservation_held and child_reaped) {
+        sequence.actions[sequence.len] = .reap;
+        sequence.len += 1;
+        return sequence;
     }
     if (sent_kill) {
         sequence.actions[sequence.len] = .signal_kill;
@@ -362,6 +386,13 @@ fn teardownSequence(sent_term: bool, sent_kill: bool) TeardownSequence {
     sequence.actions[sequence.len] = .reap;
     sequence.len += 1;
     return sequence;
+}
+
+fn childPgidReservationHeld() bool {
+    return switch (builtin.os.tag) {
+        .linux, .macos, .ios, .tvos, .watchos, .visionos => true,
+        else => false,
+    };
 }
 
 /// Decides the exact production signal set from an immediate group-liveness
@@ -628,9 +659,11 @@ fn appendUniqueTargetAssumeCapacity(
 fn signalDrainSet(
     drain_set: *DrainSet,
     child_pgid: posix.pid_t,
+    child_state: *const ChildState,
     signal: u8,
     diagnostics: *std.Io.Writer,
 ) bool {
+    latchReapedUnreservedGroup(drain_set, child_state, diagnostics);
     const action = drainSignalAction(
         drain_set.plan,
         isProcessGroupAlive(child_pgid),
@@ -650,8 +683,51 @@ fn signalDrainSet(
     return action.signal_original_group;
 }
 
-fn drainSetAlive(drain_set: *DrainSet, child_pgid: posix.pid_t, diagnostics: *std.Io.Writer) bool {
-    const group_alive = isProcessGroupAlive(child_pgid);
+/// A retained zombie reserves its numeric PGID but is not a live group member.
+/// The per-process capture is the discriminator. A capture can be incomplete
+/// because an unrelated process raced discovery; that does not turn the held
+/// leader itself into a live member. Any captured non-leader in this PGID still
+/// keeps teardown active.
+fn originalGroupHasLiveMember(
+    allocator: std.mem.Allocator,
+    child_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+    child_state: ChildState,
+) bool {
+    if (!isProcessGroupAlive(child_pgid)) return false;
+    if (child_state == .running or !childPgidReservationHeld()) return true;
+
+    var snapshot = process_tree.captureAll(allocator) catch return true;
+    defer snapshot.deinit(allocator);
+    for (snapshot.targets) |target| {
+        const record = target.record();
+        if (record.identity.pid != child_pid and record.pgid == child_pgid) return true;
+    }
+    return false;
+}
+
+fn latchReapedUnreservedGroup(
+    drain_set: *DrainSet,
+    child_state: *const ChildState,
+    diagnostics: *std.Io.Writer,
+) void {
+    if (childPgidReservationHeld() or child_state.* != .reaped or drain_set.original_group_dead) return;
+    drain_set.original_group_dead = true;
+    if (writeDiagnostic(
+        "janitor: child leader was reaped; skipping further process-group signals to avoid PGID reuse\n",
+        diagnostics,
+        .{},
+    )) |err| reportDiagnosticWriteFailure(err);
+}
+
+fn drainSetAlive(
+    drain_set: *DrainSet,
+    allocator: std.mem.Allocator,
+    child_pgid: posix.pid_t,
+    child_state: *const ChildState,
+    diagnostics: *std.Io.Writer,
+) bool {
+    const group_alive = originalGroupHasLiveMember(allocator, drain_set.child_pgid, child_pgid, child_state.*);
     drain_set.original_group_dead = drain_set.original_group_dead or !group_alive;
     if (group_alive and !drain_set.original_group_dead) return true;
     for (drain_set.escaped.items) |target| {
@@ -675,6 +751,7 @@ fn teardownGroupOnly(
     config: Config,
     watcher: *Watcher,
     child_state: *ChildState,
+    diagnostics: *std.Io.Writer,
 ) u8 {
     var sent_term = false;
     var sent_kill = false;
@@ -685,6 +762,14 @@ fn teardownGroupOnly(
         const deadline_ns = monotonicNowNs() + msToNs(config.grace_ms);
         while (monotonicNowNs() < deadline_ns) {
             _ = tryPollChild(child_pid, child_state);
+            if (!childPgidReservationHeld() and child_state.* == .reaped) {
+                if (writeDiagnostic(
+                    "janitor: child leader was reaped; skipping further process-group signals to avoid PGID reuse\n",
+                    diagnostics,
+                    .{},
+                )) |err| reportDiagnosticWriteFailure(err);
+                break;
+            }
             if (!isProcessGroupAlive(child_pgid)) break;
 
             const remaining_ms = remainingMs(deadline_ns);
@@ -693,9 +778,11 @@ fn teardownGroupOnly(
             if (event == .timeout) break;
         }
 
-        if (isProcessGroupAlive(child_pgid)) {
-            executeDiscoveryPlan(plan, child_pgid, posix.SIG.KILL, signalProcessGroup);
-            sent_kill = true;
+        if (childPgidReservationHeld() or child_state.* != .reaped) {
+            if (isProcessGroupAlive(child_pgid)) {
+                executeDiscoveryPlan(plan, child_pgid, posix.SIG.KILL, signalProcessGroup);
+                sent_kill = true;
+            }
         }
     }
 
@@ -705,14 +792,20 @@ fn teardownGroupOnly(
         _ = watcher.wait(null) catch break;
     }
 
-    return reapAfterTeardown(child_pid, child_state, teardownSequence(sent_term, sent_kill));
+    const sequence = teardownSequence(
+        childPgidReservationHeld(),
+        child_state.* == .reaped,
+        sent_term,
+        sent_kill,
+    );
+    return reapAfterTeardown(child_pid, child_state, sequence);
 }
 
 fn tryPollChild(child_pid: posix.pid_t, child_state: *ChildState) bool {
     if (child_state.* != .running) return true;
 
     const status = observeChild(child_pid) orelse return false;
-    child_state.* = .{ .observed = status };
+    child_state.* = if (childPgidReservationHeld()) .{ .observed = status } else .{ .reaped = status };
     return true;
 }
 
@@ -736,11 +829,11 @@ fn observeChildLinux(child_pid: posix.pid_t) ?u8 {
     while (true) {
         var info = std.mem.zeroes(linux.siginfo_t);
         const rc = linux.waitid(.PID, child_pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            .CHILD => return null,
-            else => return null,
+        const errno_code = posix.errno(rc);
+        switch (waitidErrnoAction(errno_code)) {
+            .success => {},
+            .retry => continue,
+            .fatal => waitidUnexpectedErrno(errno_code),
         }
         if (info.signo == 0) return null;
         return childStatusFromSiginfo(info.code, info.fields.common.second.sigchld.status);
@@ -751,15 +844,34 @@ fn observeChildDarwin(child_pid: posix.pid_t) ?u8 {
     while (true) {
         var info = std.mem.zeroes(posix.siginfo_t);
         const rc = waitid(1, @intCast(child_pid), &info, 0x00000004 | 0x00000001 | 0x00000020);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            .CHILD => return null,
-            else => return null,
+        const errno_code = posix.errno(rc);
+        switch (waitidErrnoAction(errno_code)) {
+            .success => {},
+            .retry => continue,
+            .fatal => waitidUnexpectedErrno(errno_code),
         }
         if (info.signo == 0) return null;
         return childStatusFromSiginfo(info.code, info.status);
     }
+}
+
+/// `NOHANG` with a zero siginfo is the sole running result.  The direct child
+/// remains owned until Janitor reaps it, so ECHILD and option/ABI failures mean
+/// our supervision invariant is broken rather than that the child is running.
+fn waitidUnexpectedErrno(err: posix.E) noreturn {
+    std.debug.panic("waitid direct-child observation failed unexpectedly: {s}", .{@tagName(err)});
+}
+
+const WaitidErrnoAction = enum { success, retry, fatal };
+
+/// Kept pure so tests pin the narrow set of errors that may be treated as a
+/// retry. In particular, ECHILD is never a disguised "still running" result.
+fn waitidErrnoAction(err: posix.E) WaitidErrnoAction {
+    return switch (err) {
+        .SUCCESS => .success,
+        .INTR => .retry,
+        else => .fatal,
+    };
 }
 
 fn observeChildWithoutReservation(child_pid: posix.pid_t) ?u8 {
@@ -768,13 +880,39 @@ fn observeChildWithoutReservation(child_pid: posix.pid_t) ?u8 {
     return encodeStatus(result.status);
 }
 
+const ChildExitCode = enum {
+    exited,
+    killed,
+    dumped,
+    trapped,
+    stopped,
+    continued,
+    unexpected,
+};
+
+fn childExitCodeFromSiginfo(code: c_int) ChildExitCode {
+    return switch (code) {
+        1 => .exited, // CLD_EXITED
+        2 => .killed, // CLD_KILLED
+        3 => .dumped, // CLD_DUMPED
+        4 => .trapped, // CLD_TRAPPED
+        5 => .stopped, // CLD_STOPPED
+        6 => .continued, // CLD_CONTINUED
+        else => .unexpected,
+    };
+}
+
 /// POSIX CLD_EXITED, CLD_KILLED, and CLD_DUMPED respectively. `waitid`
 /// reports the same terminal outcome as `waitpid`, just without reaping it.
 fn childStatusFromSiginfo(code: c_int, status: c_int) u8 {
-    return switch (code) {
-        1 => @intCast(status),
-        2, 3 => @intCast(@min(@as(c_int, 255), 128 + status)),
-        else => 128,
+    return switch (childExitCodeFromSiginfo(code)) {
+        .exited => @intCast(status),
+        .killed, .dumped => @intCast(@min(@as(c_int, 255), 128 + status)),
+        .trapped, .stopped, .continued => std.debug.panic(
+            "waitid reported non-terminal CLD code {d} with WEXITED",
+            .{code},
+        ),
+        .unexpected => std.debug.panic("waitid reported unknown CLD code {d}", .{code}),
     };
 }
 
@@ -1414,6 +1552,8 @@ test "drain signal action latches a dead group while retaining escaped targets" 
 test "teardown reaps after every numeric group signal" {
     const cases = [_]struct {
         name: []const u8,
+        reservation_held: bool = true,
+        child_reaped: bool = false,
         sent_term: bool,
         sent_kill: bool,
     }{
@@ -1422,10 +1562,24 @@ test "teardown reaps after every numeric group signal" {
         .{ .name = "discovery-failed", .sent_term = true, .sent_kill = true },
         .{ .name = "pgroup-only", .sent_term = true, .sent_kill = true },
         .{ .name = "child-self-exit", .sent_term = false, .sent_kill = false },
+        .{
+            .name = "bsd-reaped-during-grace",
+            .reservation_held = false,
+            .child_reaped = true,
+            .sent_term = true,
+            .sent_kill = false,
+        },
+        .{
+            .name = "bsd-child-exited-before-teardown",
+            .reservation_held = false,
+            .child_reaped = true,
+            .sent_term = false,
+            .sent_kill = false,
+        },
     };
 
     for (cases) |case| {
-        const sequence = teardownSequence(case.sent_term, case.sent_kill);
+        const sequence = teardownSequence(case.reservation_held, case.child_reaped, case.sent_term, case.sent_kill);
         var reap_count: usize = 0;
         for (0..sequence.len) |index| {
             switch (sequence.at(index)) {
@@ -1438,6 +1592,24 @@ test "teardown reaps after every numeric group signal" {
         }
         try std.testing.expectEqual(@as(usize, 1), reap_count);
     }
+}
+
+test "waitid error and CLD seams classify only factual running and terminal states" {
+    try std.testing.expectEqual(WaitidErrnoAction.success, waitidErrnoAction(.SUCCESS));
+    try std.testing.expectEqual(WaitidErrnoAction.retry, waitidErrnoAction(.INTR));
+    try std.testing.expectEqual(WaitidErrnoAction.fatal, waitidErrnoAction(.CHILD));
+    try std.testing.expectEqual(WaitidErrnoAction.fatal, waitidErrnoAction(.INVAL));
+
+    const cases = [_]struct { raw: c_int, expected: ChildExitCode }{
+        .{ .raw = 1, .expected = .exited },
+        .{ .raw = 2, .expected = .killed },
+        .{ .raw = 3, .expected = .dumped },
+        .{ .raw = 4, .expected = .trapped },
+        .{ .raw = 5, .expected = .stopped },
+        .{ .raw = 6, .expected = .continued },
+        .{ .raw = 99, .expected = .unexpected },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, childExitCodeFromSiginfo(case.raw));
 }
 
 test "resweep publication allocation failure leaves drain set valid" {

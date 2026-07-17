@@ -41,6 +41,7 @@ pub fn main() !void {
     defer allocator.free(e2e_exe);
 
     try testVersionCommand(allocator, janitor_exe);
+    try testTrivialExitSkipsGraceWindow(allocator, janitor_exe);
     try testNormalExit(allocator, janitor_exe);
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
     try testWatchPidKillsProcessGroup(allocator, janitor_exe);
@@ -351,6 +352,28 @@ fn testNormalExit(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
 
     const term = try child.spawnAndWait();
     try expectExited(term, 7, "normal child exit status is propagated");
+}
+
+// A held WNOWAIT zombie reserves the original PGID on Linux/Darwin, but it is
+// not a live group member. This compiled-binary regression test keeps a wide
+// grace window so mistakenly treating that reservation as liveness is obvious.
+fn testTrivialExitSkipsGraceWindow(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    var child = std.process.Child.init(&.{ janitor_exe, "--grace-ms", "1500", "--", "true" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
+
+    const started_ns = monotonicNowNs();
+    try child.spawn();
+    const stderr_file = child.stderr orelse return error.MissingStderrPipe;
+    const stderr = try stderr_file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(stderr);
+    const term = try child.wait();
+    const elapsed_ns = monotonicNowNs() - started_ns;
+
+    try expectExited(term, 0, "trivial child exit status is propagated");
+    try std.testing.expect(elapsed_ns < 750 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), stderr.len);
 }
 
 fn testWatchPathKillsProcessGroup(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {

@@ -161,7 +161,10 @@ the original child process group.
 - **REQ-JANITOR-026**: Janitor advertises snapshot descendant draining only on
   platforms where discovery, identity validation, individual signaling, and
   their native verification meet these requirements; unsupported backends retain
-  no silent partial descendant-drain claim.
+  no silent partial descendant-drain claim. On FreeBSD, OpenBSD, NetBSD, and
+  DragonFly, observing child exit reaps the group leader; Janitor then latches
+  numeric group signaling off rather than risk a recycled PGID, accepting any
+  remaining group cleanup breadth it can no longer safely provide.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, applies a credential-free ad-hoc signature, packages
   README and LICENSE beside the binary, extracts the archive, and verifies the
@@ -228,6 +231,8 @@ the original child process group.
   terminal from a background process group cannot stop `janitor`.
 - Cleanup logic is idempotent; `ESRCH` while signaling means the group already
   or individually verified target already drained.
+- A platform that cannot retain the child zombie never sends a numeric group
+  signal after observing and reaping that group leader.
 - Parent death is detected as `getppid() != original_parent`, not
   `getppid() == 1`.
 - Release automation has no signing or notarization secrets to read, print, or
@@ -252,6 +257,9 @@ the original child process group.
 - No claim that Darwin/BSD can atomically bind `kill(pid, signal)` to the
   captured start-time identity; their validation-to-`kill` TOCTOU is an
   unavoidable native-platform limit.
+- No claim that FreeBSD, OpenBSD, NetBSD, or DragonFly can continue original
+  group cleanup after their child-exit observation reaps the group leader;
+  numeric PGID signaling stops at that point to prevent reuse misdelivery.
 - No Developer ID identity, Apple notarization, Gatekeeper approval, signed
   macOS `.pkg`, or browser/Finder distribution contract.
 - No Windows binary release until the implementation supports Windows process
@@ -334,7 +342,10 @@ the original child process group.
   `testVersionCommand`.
 - REQ-JANITOR-016: `src/check_plugin_version.zig` and `zig build
   check-plugin-version`.
-- REQ-JANITOR-009: `src/e2e.zig` `testNormalExit`.
+- REQ-JANITOR-009, REQ-JANITOR-025: `src/e2e.zig` `testNormalExit` and
+  `testTrivialExitSkipsGraceWindow`, which preserves a direct child's exit
+  status while proving its retained PGID-reservation zombie does not consume
+  the teardown grace window or emit diagnostics.
 - REQ-JANITOR-010, REQ-JANITOR-011, REQ-JANITOR-012: `src/root.zig` watcher
   backend selection, plus native and cross-target builds.
 - REQ-JANITOR-013: `src/e2e.zig` `testInteractiveForegroundHandoff`.
@@ -378,7 +389,8 @@ the original child process group.
   cleanup and reports limitations` proves that unavailable discovery reports a
   limitation while retaining group cleanup; `README.md` documents that Linux
   and macOS are the only advertised snapshot-drain platforms and that other
-  BSD platforms remain group-only. `nix develop -c zig build
+  BSD platforms remain group-only and stop numeric group signals after reaping
+  a child leader. `nix develop -c zig build
   -Dtarget=x86_64-linux` type-checks the supported Linux implementation. No
   native BSD snapshot-drain verifier exists because BSD is deliberately not an
   advertised descendant-drain platform.
