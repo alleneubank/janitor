@@ -335,7 +335,10 @@ fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: [
     const o_rdwr: c_int = 0o2;
     const master = posix_openpt(o_rdwr);
     if (master < 0) return error.OpenPtFailed;
-    defer posix.close(master);
+    // The leader-reap defer below closes the master early; this defer only
+    // covers error returns before the leader exists.
+    var master_closed = false;
+    defer if (!master_closed) posix.close(master);
     if (grantpt(master) != 0) return error.GrantPtFailed;
     if (unlockpt(master) != 0) return error.UnlockPtFailed;
 
@@ -386,8 +389,15 @@ fn testInteractiveForegroundHandoff(allocator: std.mem.Allocator, janitor_exe: [
 
     // Reap the session leader and nuke any survivors regardless of pass/fail —
     // janitor's own test must not leak the processes it is meant to clean up.
+    // The master must close before the waitpid: on macOS a session leader's
+    // exit can block inside the kernel's pty teardown while the master side
+    // stays open with unread output (the leader parks in `E` state and is
+    // unkillable), and nothing else ever drains this master — reaping with it
+    // open deadlocks the cleanup itself.
     defer {
         killGroup(leader_pid);
+        posix.close(master);
+        master_closed = true;
         _ = posix.waitpid(leader_pid, 0);
     }
 
