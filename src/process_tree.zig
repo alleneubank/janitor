@@ -810,6 +810,12 @@ const ProcBsdInfo = extern struct {
 };
 
 extern "c" fn proc_listallpids(buffer: ?*anyopaque, buffer_size: c_int) c_int;
+extern "c" fn proc_listpids(
+    type: c_uint,
+    typeinfo: c_uint,
+    buffer: ?*anyopaque,
+    buffer_size: c_int,
+) c_int;
 extern "c" fn proc_pidinfo(
     pid: c_int,
     flavor: c_int,
@@ -817,9 +823,39 @@ extern "c" fn proc_pidinfo(
     buffer: *anyopaque,
     buffer_size: c_int,
 ) c_int;
+/// Darwin exposes thread-local `errno` through `__error`. Callers must read it
+/// immediately after a libproc call, before any operation can overwrite it.
+extern "c" fn __error() *c_int;
 
 const proc_pidtbsdinfo = 3;
-const proc_status_zombie = 5;
+const proc_pgrp_only = 2;
+
+/// `proc_listpids(PROC_PGRP_ONLY, ...)` is the Darwin membership authority.
+/// Its kernel-side PGID filter avoids inspecting unrelated process records,
+/// which routinely fail with EPERM under macOS privacy policy.
+const DarwinGroupMembershipEnumeration = union(enum) {
+    pids: []const c_int,
+    unavailable,
+};
+
+/// Classifies the complete result of a kernel-filtered PGID enumeration. The
+/// enumerator has already established the PGID, so another returned PID is a
+/// member without a `proc_pidinfo` record read. A PID that exits before the
+/// subsequent group signal is harmlessly treated as gone by that signal path.
+fn classifyDarwinGroupMembershipEnumeration(
+    enumeration: DarwinGroupMembershipEnumeration,
+    reserved_zombie_pid: posix.pid_t,
+) GroupMembership {
+    switch (enumeration) {
+        .unavailable => return .unknown,
+        .pids => |pids| {
+            for (pids) |pid| {
+                if (pid > 0 and pid != reserved_zombie_pid) return .live;
+            }
+            return .none;
+        },
+    }
+}
 
 fn groupMembershipDarwin(
     allocator: std.mem.Allocator,
@@ -828,7 +864,9 @@ fn groupMembershipDarwin(
 ) GroupMembership {
     if (comptime builtin.os.tag != .macos) return .unknown;
 
-    const initial_count = proc_listallpids(null, 0);
+    if (child_pgid <= 0) return .unknown;
+    const pgid: c_uint = @intCast(child_pgid);
+    const initial_count = proc_listpids(proc_pgrp_only, pgid, null, 0);
     if (initial_count <= 0) return .unknown;
     var capacity: usize = @intCast(initial_count);
     capacity = std.math.add(usize, capacity, 64) catch return .unknown;
@@ -839,26 +877,14 @@ fn groupMembershipDarwin(
         defer allocator.free(pids);
         const bytes = std.math.mul(usize, capacity, @sizeOf(c_int)) catch return .unknown;
         const byte_capacity = std.math.cast(c_int, bytes) orelse return .unknown;
-        const count = proc_listallpids(@ptrCast(pids.ptr), byte_capacity);
+        const count = proc_listpids(proc_pgrp_only, pgid, @ptrCast(pids.ptr), byte_capacity);
         if (count < 0) return .unknown;
         const actual: usize = @intCast(count);
         if (actual >= capacity) {
             capacity = std.math.add(usize, actual, 64) catch return .unknown;
             continue;
         }
-        for (pids[0..actual]) |pid| {
-            if (pid <= 0) continue;
-            switch (classifyGroupMembershipWalk(
-                &.{darwinGroupMembershipEntry(pid)},
-                reserved_zombie_pid,
-                child_pgid,
-            )) {
-                .live => return .live,
-                .unknown => return .unknown,
-                .none => {},
-            }
-        }
-        return .none;
+        return classifyDarwinGroupMembershipEnumeration(.{ .pids = pids[0..actual] }, reserved_zombie_pid);
     }
     return .unknown;
 }
@@ -939,7 +965,14 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
     if (comptime builtin.os.tag != .macos) return null;
     var info: ProcBsdInfo = undefined;
     const returned = proc_pidinfo(pid, proc_pidtbsdinfo, 0, @ptrCast(&info), @sizeOf(ProcBsdInfo));
-    if (returned != @sizeOf(ProcBsdInfo) or info.pid != @as(u32, @intCast(pid))) return null;
+    const errno_code = darwinThreadErrno();
+    switch (darwinProcPidInfoDisposition(returned, errno_code)) {
+        .complete => {},
+        // Both a gone record and an unreadable record leave capture incomplete.
+        // The distinction matters to membership, where unreadable may be live.
+        .disappeared, .unavailable => return null,
+    }
+    if (info.pid != @as(u32, @intCast(pid))) return null;
     return .{
         .identity = .{ .pid = pid, .start_token = (@as(u128, info.start_tvsec) << 64) | info.start_tvusec },
         .ppid = @intCast(info.ppid),
@@ -947,24 +980,19 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
     };
 }
 
-fn darwinGroupMembershipEntry(pid: posix.pid_t) GroupMembershipWalkEntry {
-    if (comptime builtin.os.tag != .macos) return .unavailable;
-    var info: ProcBsdInfo = undefined;
-    const returned = proc_pidinfo(pid, proc_pidtbsdinfo, 0, @ptrCast(&info), @sizeOf(ProcBsdInfo));
-    if (returned != @sizeOf(ProcBsdInfo)) return darwinGroupMembershipEntryFromShortRead(returned);
-    if (info.pid != @as(u32, @intCast(pid))) return .unavailable;
-    return .{ .member = .{
-        .pid = pid,
-        .pgid = @intCast(info.pgid),
-        .live = info.status != proc_status_zombie,
-    } };
+const DarwinProcPidInfoDisposition = enum { complete, disappeared, unavailable };
+
+/// Classifies libproc's byte count and calling-thread errno without performing
+/// any platform I/O. A zero-byte read proves disappearance only for ESRCH;
+/// EPERM and every other errno may describe a live but unreadable process.
+fn darwinProcPidInfoDisposition(returned: c_int, errno_code: posix.E) DarwinProcPidInfoDisposition {
+    if (returned == @sizeOf(ProcBsdInfo)) return .complete;
+    if (returned == 0 and errno_code == .SRCH) return .disappeared;
+    return .unavailable;
 }
 
-/// This pure classification makes the short-read safety rule testable without
-/// invoking libproc. Its zero-byte result positively reports that the listed
-/// PID disappeared; every other short result remains unavailable.
-fn darwinGroupMembershipEntryFromShortRead(returned: c_int) GroupMembershipWalkEntry {
-    return if (returned == 0) .disappeared else .unavailable;
+fn darwinThreadErrno() posix.E {
+    return @enumFromInt(__error().*);
 }
 
 /// The preliminary child read supplies only a parent lead. The record returned
@@ -1342,20 +1370,54 @@ test "group membership walk distinguishes disappearance from unavailable entries
             },
             .expected = .unknown,
         },
-        .{
-            .name = "Darwin short read without positive gone indication is unknown",
-            .entries = &.{
-                .{ .member = .{ .pid = 70, .pgid = 70, .live = false } },
-                darwinGroupMembershipEntryFromShortRead(@sizeOf(ProcBsdInfo) - 1),
-            },
-            .expected = .unknown,
-        },
     };
 
     for (cases) |case| {
         errdefer std.log.err("group membership case failed: {s}", .{case.name});
         try std.testing.expectEqual(case.expected, classifyGroupMembershipWalk(case.entries, 70, 70));
     }
+}
+
+test "Darwin membership enumeration needs no per-PID record reads" {
+    const Case = struct {
+        name: []const u8,
+        enumeration: DarwinGroupMembershipEnumeration,
+        expected: GroupMembership,
+    };
+    const zombie_only = [_]c_int{70};
+    const live_member = [_]c_int{ 70, 71 };
+    const cases = [_]Case{
+        .{
+            .name = "only the retained zombie has no live group member",
+            .enumeration = .{ .pids = &zombie_only },
+            .expected = .none,
+        },
+        .{
+            .name = "another enumerated PID keeps the group live",
+            .enumeration = .{ .pids = &live_member },
+            .expected = .live,
+        },
+        .{
+            .name = "enumeration failure leaves membership unknown",
+            .enumeration = .unavailable,
+            .expected = .unknown,
+        },
+    };
+
+    for (cases) |case| {
+        errdefer std.log.err("Darwin membership case failed: {s}", .{case.name});
+        try std.testing.expectEqual(case.expected, classifyDarwinGroupMembershipEnumeration(case.enumeration, 70));
+    }
+}
+
+test "Darwin capture record reads distinguish gone from unavailable" {
+    try std.testing.expectEqual(DarwinProcPidInfoDisposition.disappeared, darwinProcPidInfoDisposition(0, .SRCH));
+    try std.testing.expectEqual(DarwinProcPidInfoDisposition.unavailable, darwinProcPidInfoDisposition(0, .PERM));
+    try std.testing.expectEqual(DarwinProcPidInfoDisposition.unavailable, darwinProcPidInfoDisposition(0, .IO));
+    try std.testing.expectEqual(
+        DarwinProcPidInfoDisposition.unavailable,
+        darwinProcPidInfoDisposition(@sizeOf(ProcBsdInfo) - 1, .SUCCESS),
+    );
 }
 
 test "linux public captureIdentity path compiles" {

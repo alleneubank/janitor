@@ -22,8 +22,10 @@ janitor --watch-path '<session-lock>' --watch-pid '<claude-pid>' --grace-ms <ms>
   Bash command runs under a per-command shell that survives the session, so
   watching the session pid directly is the only reliable crash trigger.
 
-On teardown, `janitor` sends `SIGTERM` to the command's process group, waits the
-grace window, then `SIGKILL`s anything left — leaving zero orphans.
+On teardown, `janitor` sends `SIGTERM` to the original command process group,
+then drains live descendants whose identity it can prove. Processes already
+reparented before capture and targets that fail identity verification are
+skipped with a diagnostic, so they are outside that guarantee.
 
 Your command's stdout/stderr, exit code, and `run_in_background` behavior are
 unchanged; `janitor` is transparent.
