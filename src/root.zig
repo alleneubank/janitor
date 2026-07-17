@@ -216,7 +216,10 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
                 // as a zombie to reserve its PGID.  `kill(-pgid, 0)` therefore
                 // sees the reservation itself; only another live member makes
                 // this a real teardown.
-                if (originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state)) {
+                const action = childExitAction(
+                    originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state),
+                );
+                if (action == .teardown) {
                     return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .child_exited);
                 }
 
@@ -268,7 +271,7 @@ fn teardownWithDiagnostics(
     var drain_set = DrainSet.init(allocator, config.drain_scope, child_pid, child_pgid) catch |err| {
         const plan = discoveryPlan(.capture_failed);
         reportDiscoveryPlan(diagnostics, plan, @errorName(err));
-        return teardownGroupOnly(plan, child_pid, child_pgid, config, watcher, child_state, diagnostics);
+        return teardownGroupOnly(allocator, plan, child_pid, child_pgid, config, watcher, child_state, diagnostics);
     };
     defer drain_set.deinit(allocator);
 
@@ -303,7 +306,7 @@ fn teardownWithDiagnostics(
     // its retained Linux handle still proves it is the captured identity. If
     // the original group is already dead, such a live captured target must
     // have escaped it; publish that exact capability for individual draining.
-    if (!originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*)) {
+    if (originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*) == .none) {
         drain_set.original_group_dead = true;
         drain_set.promoteLiveCapturedTargets(allocator) catch |err| {
             std.log.warn(
@@ -365,6 +368,8 @@ const DrainSignalAction = struct {
     original_group_dead: bool,
 };
 
+const ChildExitAction = enum { teardown, reap };
+
 /// The pure completion seam records every numeric process-group signal before
 /// the one real reap. Keeping it in production code makes the reservation
 /// ordering independently testable across all teardown routes.
@@ -385,6 +390,26 @@ const TeardownSequence = struct {
 /// numeric PGID probe as well as every group signal.
 fn numericGroupSignalsAllowed(reservation_held: bool, child_reaped: bool) bool {
     return reservation_held or !child_reaped;
+}
+
+/// A child-exit observation is safe to fast-reap only after membership
+/// enumeration proves that the retained zombie is the original group's sole
+/// remaining member. An unavailable enumeration deliberately drains instead.
+fn childExitAction(membership: process_tree.GroupMembership) ChildExitAction {
+    return switch (membership) {
+        .none => .reap,
+        .live, .unknown => .teardown,
+    };
+}
+
+/// Numeric group probes have the same reuse hazard as numeric group signals.
+/// The reservation and dead-group latch must both be checked before probing.
+fn numericGroupProbeAllowed(
+    reservation_held: bool,
+    child_reaped: bool,
+    original_group_dead: bool,
+) bool {
+    return numericGroupSignalsAllowed(reservation_held, child_reaped) and !original_group_dead;
 }
 
 const ForcedTeardownPlan = struct {
@@ -734,9 +759,14 @@ fn signalDrainSet(
     diagnostics: *std.Io.Writer,
 ) bool {
     latchReapedUnreservedGroup(drain_set, child_state, diagnostics);
+    const group_alive = if (numericGroupProbeAllowed(
+        childPgidReservationHeld(),
+        child_state.* == .reaped,
+        drain_set.original_group_dead,
+    )) isProcessGroupAlive(child_pgid) else false;
     const action = drainSignalAction(
         drain_set.plan,
-        isProcessGroupAlive(child_pgid),
+        group_alive,
         drain_set.original_group_dead,
     );
     drain_set.original_group_dead = action.original_group_dead;
@@ -754,26 +784,22 @@ fn signalDrainSet(
 }
 
 /// A retained zombie reserves its numeric PGID but is not a live group member.
-/// The per-process capture is the discriminator. A capture can be incomplete
-/// because an unrelated process raced discovery; that does not turn the held
-/// leader itself into a live member. Any captured non-leader in this PGID still
-/// keeps teardown active.
+/// Membership is deliberately independent from descendant ancestry discovery:
+/// routine ancestry gaps cannot delay the direct-child fast path. Only failure
+/// to enumerate group membership is conservatively treated as live.
 fn originalGroupHasLiveMember(
     allocator: std.mem.Allocator,
     child_pid: posix.pid_t,
     child_pgid: posix.pid_t,
     child_state: ChildState,
-) bool {
-    if (!isProcessGroupAlive(child_pgid)) return false;
-    if (child_state == .running or !childPgidReservationHeld()) return true;
-
-    var snapshot = process_tree.captureAll(allocator) catch return true;
-    defer snapshot.deinit(allocator);
-    for (snapshot.targets) |target| {
-        const record = target.record();
-        if (record.identity.pid != child_pid and record.pgid == child_pgid) return true;
+) process_tree.GroupMembership {
+    if (child_state == .running) return .live;
+    if (!childPgidReservationHeld()) return .unknown;
+    const membership = process_tree.groupMembership(allocator, child_pid, child_pgid);
+    if (membership == .unknown) {
+        std.log.warn("original process-group member discovery was unavailable; draining conservatively", .{});
     }
-    return false;
+    return membership;
 }
 
 fn latchReapedUnreservedGroup(
@@ -797,8 +823,13 @@ fn drainSetAlive(
     child_state: *const ChildState,
     diagnostics: *std.Io.Writer,
 ) bool {
-    const group_alive = originalGroupHasLiveMember(allocator, drain_set.child_pgid, child_pgid, child_state.*);
-    drain_set.original_group_dead = drain_set.original_group_dead or !group_alive;
+    const membership = if (numericGroupProbeAllowed(
+        childPgidReservationHeld(),
+        child_state.* == .reaped,
+        drain_set.original_group_dead,
+    )) originalGroupHasLiveMember(allocator, drain_set.child_pgid, child_pgid, child_state.*) else .none;
+    const group_alive = membership != .none;
+    drain_set.original_group_dead = drain_set.original_group_dead or membership == .none;
     if (group_alive and !drain_set.original_group_dead) return true;
     for (drain_set.escaped.items) |target| {
         switch (targetDecision(target.liveness())) {
@@ -815,6 +846,7 @@ fn drainSetAlive(
 }
 
 fn teardownGroupOnly(
+    allocator: std.mem.Allocator,
     plan: DiscoveryPlan,
     child_pid: posix.pid_t,
     child_pgid: posix.pid_t,
@@ -828,9 +860,11 @@ fn teardownGroupOnly(
     // This gate intentionally comes before the first liveness probe. BSD
     // kqueue has already reaped a child-exit event, so even probe-only use of
     // the numeric PGID could observe a recycled unrelated group.
-    if (numericGroupSignalsAllowed(childPgidReservationHeld(), child_state.* == .reaped) and
-        isProcessGroupAlive(child_pgid))
-    {
+    if (numericGroupProbeAllowed(
+        childPgidReservationHeld(),
+        child_state.* == .reaped,
+        false,
+    ) and originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*) != .none) {
         executeDiscoveryPlan(plan, child_pgid, posix.SIG.TERM, signalProcessGroup);
         sent_term = true;
 
@@ -845,7 +879,7 @@ fn teardownGroupOnly(
                 )) |err| reportDiagnosticWriteFailure(err);
                 break;
             }
-            if (!isProcessGroupAlive(child_pgid)) break;
+            if (originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*) == .none) break;
 
             const remaining_ms = remainingMs(deadline_ns);
             if (remaining_ms == 0) break;
@@ -853,8 +887,8 @@ fn teardownGroupOnly(
             if (event == .timeout) break;
         }
 
-        if (numericGroupSignalsAllowed(childPgidReservationHeld(), child_state.* == .reaped)) {
-            if (isProcessGroupAlive(child_pgid)) {
+        if (numericGroupProbeAllowed(childPgidReservationHeld(), child_state.* == .reaped, false)) {
+            if (originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state.*) != .none) {
                 executeDiscoveryPlan(plan, child_pgid, posix.SIG.KILL, signalProcessGroup);
                 sent_kill = true;
             }
@@ -1630,12 +1664,27 @@ test "drain signal action latches a dead group while retaining escaped targets" 
     try std.testing.expect(!live_group.original_group_dead);
 }
 
+test "membership unknown after child exit drains without latching the group dead" {
+    try std.testing.expectEqual(ChildExitAction.teardown, childExitAction(.unknown));
+
+    const action = drainSignalAction(discoveryPlan(.incomplete), true, false);
+    try std.testing.expect(action.signal_original_group);
+    try std.testing.expect(!action.original_group_dead);
+}
+
+test "membership complete with only retained zombie preserves immediate reap fast path" {
+    try std.testing.expectEqual(ChildExitAction.reap, childExitAction(.none));
+}
+
 test "reaped non-reservation leader suppresses the initial numeric group probe" {
     // FreeBSD/NetBSD child-exit observation consumes the group leader. The
     // fallback must not even test that numeric PGID before declining TERM.
     try std.testing.expect(!numericGroupSignalsAllowed(false, true));
     try std.testing.expect(numericGroupSignalsAllowed(false, false));
     try std.testing.expect(numericGroupSignalsAllowed(true, true));
+    try std.testing.expect(!numericGroupProbeAllowed(false, true, false));
+    try std.testing.expect(!numericGroupProbeAllowed(true, true, true));
+    try std.testing.expect(numericGroupProbeAllowed(true, true, false));
 }
 
 test "forced teardown resweeps an in-group capture that escapes after TERM" {

@@ -40,6 +40,37 @@ pub const ProcessRecord = struct {
     }
 };
 
+/// The answer to a process-group membership walk. This deliberately answers a
+/// narrower question than ancestry discovery: a table walk can prove that the
+/// retained child zombie is alone even when unrelated rows make ancestry
+/// validation incomplete.
+pub const GroupMembership = enum { none, live, unknown };
+
+/// A platform membership walker supplies only the fields needed for the pure
+/// classification below. `live` excludes zombies, which reserve a PID but do
+/// not keep a process group alive.
+pub const GroupMember = struct {
+    pid: posix.pid_t,
+    pgid: posix.pid_t,
+    live: bool,
+};
+
+/// Classifies a completed process-group membership walk. The child leader is
+/// intentionally excluded because the caller holds its zombie as the PGID
+/// reservation; any other live member requires teardown.
+pub fn classifyGroupMembership(
+    members: []const GroupMember,
+    reserved_zombie_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+) GroupMembership {
+    for (members) |member| {
+        if (member.pid != reserved_zombie_pid and member.pgid == child_pgid and member.live) {
+            return .live;
+        }
+    }
+    return .none;
+}
+
 pub const Discovery = struct {
     records: []ProcessRecord,
     incomplete: bool,
@@ -337,6 +368,21 @@ pub fn captureAll(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocat
     };
 }
 
+/// Enumerates current process-group membership without attempting to prove any
+/// PPID ancestry. Per-process disappearance during the walk is a dead entry;
+/// inability to enumerate the process table itself is the only unknown result.
+pub fn groupMembership(
+    allocator: std.mem.Allocator,
+    reserved_zombie_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+) GroupMembership {
+    return switch (builtin.os.tag) {
+        .linux => groupMembershipLinux(reserved_zombie_pid, child_pgid),
+        .macos => groupMembershipDarwin(allocator, reserved_zombie_pid, child_pgid),
+        else => .unknown,
+    };
+}
+
 pub fn captureIdentity(pid: posix.pid_t) ?ProcessIdentity {
     return switch (builtin.os.tag) {
         .linux => captureLinuxOne(pid) orelse return null,
@@ -397,6 +443,15 @@ fn readLinuxHandleRecord(
 /// `) <state> ` boundary is searched from the right because `comm` may include
 /// whitespace and closing parentheses.
 pub fn parseLinuxStat(input: []const u8) ?ProcessRecord {
+    return (parseLinuxStatWithState(input) orelse return null).record;
+}
+
+const LinuxStat = struct {
+    record: ProcessRecord,
+    state: u8,
+};
+
+fn parseLinuxStatWithState(input: []const u8) ?LinuxStat {
     const open = std.mem.indexOf(u8, input, " (") orelse return null;
     const close = std.mem.lastIndexOf(u8, input, ") ") orelse return null;
     if (close <= open or close + 4 > input.len or input[close + 3] != ' ') return null;
@@ -418,7 +473,42 @@ pub fn parseLinuxStat(input: []const u8) ?ProcessRecord {
             break;
         }
     }
-    return .{ .identity = .{ .pid = pid, .start_token = start_time orelse return null }, .ppid = ppid, .pgid = pgid };
+    return .{
+        .record = .{
+            .identity = .{ .pid = pid, .start_token = start_time orelse return null },
+            .ppid = ppid,
+            .pgid = pgid,
+        },
+        .state = input[close + 2],
+    };
+}
+
+fn groupMembershipLinux(
+    reserved_zombie_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+) GroupMembership {
+    if (comptime builtin.os.tag != .linux) return .unknown;
+
+    var proc = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return .unknown;
+    defer proc.close();
+    var iterator = proc.iterate();
+    while (true) {
+        const maybe_entry = iterator.next() catch return .unknown;
+        const entry = maybe_entry orelse break;
+        if (entry.kind != .directory) continue;
+        const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
+        if (pid <= 0) continue;
+
+        var process = proc.openDir(entry.name, .{ .iterate = true }) catch continue;
+        defer process.close();
+        const stat = readLinuxStatWithState(process) catch continue orelse continue;
+        if (classifyGroupMembership(&.{.{
+            .pid = stat.record.identity.pid,
+            .pgid = stat.record.pgid,
+            .live = stat.state != 'Z',
+        }}, reserved_zombie_pid, child_pgid) == .live) return .live;
+    }
+    return .none;
 }
 
 fn captureLinux(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator.Error)!Snapshot {
@@ -555,6 +645,11 @@ fn linuxProcEntryIdentityFromStatx(
 }
 
 fn readLinuxStat(process: std.fs.Dir) LinuxAcquireError!?ProcessRecord {
+    const stat = try readLinuxStatWithState(process) orelse return null;
+    return stat.record;
+}
+
+fn readLinuxStatWithState(process: std.fs.Dir) LinuxAcquireError!?LinuxStat {
     var stat = process.openFile("stat", .{}) catch |err| {
         _ = try linuxAcquisitionDispositionFromError(err);
         return null;
@@ -565,7 +660,7 @@ fn readLinuxStat(process: std.fs.Dir) LinuxAcquireError!?ProcessRecord {
         _ = try linuxAcquisitionDispositionFromError(err);
         return null;
     };
-    return parseLinuxStat(buffer[0..bytes]);
+    return parseLinuxStatWithState(buffer[0..bytes]);
 }
 
 const LinuxAcquisitionDisposition = enum { incomplete };
@@ -657,6 +752,42 @@ extern "c" fn proc_pidinfo(
 ) c_int;
 
 const proc_pidtbsdinfo = 3;
+const proc_status_zombie = 5;
+
+fn groupMembershipDarwin(
+    allocator: std.mem.Allocator,
+    reserved_zombie_pid: posix.pid_t,
+    child_pgid: posix.pid_t,
+) GroupMembership {
+    if (comptime builtin.os.tag != .macos) return .unknown;
+
+    const initial_count = proc_listallpids(null, 0);
+    if (initial_count <= 0) return .unknown;
+    var capacity: usize = @intCast(initial_count);
+    capacity = std.math.add(usize, capacity, 64) catch return .unknown;
+
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const pids = allocator.alloc(c_int, capacity) catch return .unknown;
+        defer allocator.free(pids);
+        const bytes = std.math.mul(usize, capacity, @sizeOf(c_int)) catch return .unknown;
+        const byte_capacity = std.math.cast(c_int, bytes) orelse return .unknown;
+        const count = proc_listallpids(@ptrCast(pids.ptr), byte_capacity);
+        if (count < 0) return .unknown;
+        const actual: usize = @intCast(count);
+        if (actual >= capacity) {
+            capacity = std.math.add(usize, actual, 64) catch return .unknown;
+            continue;
+        }
+        for (pids[0..actual]) |pid| {
+            if (pid <= 0) continue;
+            const member = captureDarwinGroupMember(pid) orelse continue;
+            if (classifyGroupMembership(&.{member}, reserved_zombie_pid, child_pgid) == .live) return .live;
+        }
+        return .none;
+    }
+    return .unknown;
+}
 
 fn captureDarwin(allocator: std.mem.Allocator) (CaptureError || std.mem.Allocator.Error)!Snapshot {
     if (comptime builtin.os.tag != .macos) unreachable;
@@ -739,6 +870,18 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
         .identity = .{ .pid = pid, .start_token = (@as(u128, info.start_tvsec) << 64) | info.start_tvusec },
         .ppid = @intCast(info.ppid),
         .pgid = @intCast(info.pgid),
+    };
+}
+
+fn captureDarwinGroupMember(pid: posix.pid_t) ?GroupMember {
+    if (comptime builtin.os.tag != .macos) return null;
+    var info: ProcBsdInfo = undefined;
+    const returned = proc_pidinfo(pid, proc_pidtbsdinfo, 0, @ptrCast(&info), @sizeOf(ProcBsdInfo));
+    if (returned != @sizeOf(ProcBsdInfo) or info.pid != @as(u32, @intCast(pid))) return null;
+    return .{
+        .pid = pid,
+        .pgid = @intCast(info.pgid),
+        .live = info.status != proc_status_zombie,
     };
 }
 
@@ -1059,6 +1202,22 @@ test "linux stat parser survives hostile comm" {
     try std.testing.expectEqual(@as(posix.pid_t, 55), parsed.ppid);
     try std.testing.expectEqual(@as(posix.pid_t, 66), parsed.pgid);
     try std.testing.expectEqual(@as(u128, 12345), parsed.identity.start_token);
+}
+
+test "group membership is independent from ancestry completeness" {
+    const zombie_only = [_]GroupMember{
+        .{ .pid = 70, .pgid = 70, .live = false },
+        // This unrelated row could make ancestry discovery incomplete, but it
+        // has no bearing on whether PGID 70 has a live member.
+        .{ .pid = 91, .pgid = 91, .live = true },
+    };
+    try std.testing.expectEqual(GroupMembership.none, classifyGroupMembership(&zombie_only, 70, 70));
+
+    const live_member = [_]GroupMember{
+        .{ .pid = 70, .pgid = 70, .live = false },
+        .{ .pid = 71, .pgid = 70, .live = true },
+    };
+    try std.testing.expectEqual(GroupMembership.live, classifyGroupMembership(&live_member, 70, 70));
 }
 
 test "linux public captureIdentity path compiles" {

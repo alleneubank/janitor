@@ -151,9 +151,13 @@ the original child process group.
   process whose ancestry is proven from a still-matching captured identity and
   whose new child-to-parent edge carries the same before/after parent-identity
   binding as the initial snapshot.
-- **REQ-JANITOR-023**: Incomplete discovery emits a clear diagnostic and still
-  drains the original child process group. It never blocks that cleanup or
-  broadens the guessed individual signal set.
+- **REQ-JANITOR-023**: Incomplete ancestry discovery emits a clear diagnostic
+  and still drains the original child process group. It never blocks that
+  cleanup or broadens the guessed individual signal set. The separate
+  process-group membership walk proves only whether a live non-zombie member
+  remains in the original PGID; an unavailable membership walk is diagnosed
+  and conservatively drained, while unrelated ancestry gaps do not prevent the
+  retained-zombie fast path.
 - **REQ-JANITOR-024**: Janitor decides TERM-to-KILL escalation from liveness of
   the full drain set, not only the original child process group or direct child.
 - **REQ-JANITOR-025**: Descendant-aware teardown preserves the direct child's
@@ -384,7 +388,11 @@ the original child process group.
   limitations`, which executes the production plan with a recorder and captures
   incomplete/capture-failure diagnostics, and `stale descendant identity from
   completed discovery is diagnosed`, which captures the stale-identity
-  diagnostic from the production reporter.
+  diagnostic from the production reporter; `group membership is independent
+  from ancestry completeness`, `membership unknown after child exit drains
+  without latching the group dead`, and `membership complete with only retained
+  zombie preserves immediate reap fast path`, which exercise the distinct
+  ancestry and group-membership decision seams.
 - REQ-JANITOR-022: compiled-binary `src/e2e.zig`
   `testWatchPathTermEscapeDescendant` proves a descendant captured in the
   original group can call `setsid()` from its TERM handler, be rediscovered
