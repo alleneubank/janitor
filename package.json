@@ -1,0 +1,17 @@
+{
+  "name": "janitor",
+  "description": "Pi package for alleneubank/janitor: wraps long-running bash commands in a janitor process supervisor (graceful termination, background tracking). Exposes the PreToolUse + SessionEnd hooks as a pi extension.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "extensions",
+    "janitor",
+    "supervisor",
+    "bash"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi-hooks.ts"
+    ]
+  }
+}
