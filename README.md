@@ -113,6 +113,20 @@ Install from the Claude Code plugin marketplace:
 /plugin install janitor-bash-drain@janitor
 ```
 
+### Pi package
+
+Install janitor as a [pi package](https://pi.dev/packages) to wire the same
+`PreToolUse(Bash)` wrap and `SessionEnd` cleanup into the pi coding agent via
+a hooks extension:
+
+```bash
+pi install git:git@github.com:alleneubank/janitor.git
+```
+
+The extension execs the canonical `janitor cc-hook` binary (fail-open, like
+`hooks.json`). Install the `janitor` binary first via the `curl | sh` installer
+above.
+
 See `plugin/` and `plugin/README.md` for install details and the `JANITOR_CC_*`
 configuration knobs.
 
