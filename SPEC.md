@@ -387,8 +387,9 @@ the original child process group.
   (`janitor cc-hook ... 2>/dev/null || true`).
 - REQ-PLUGIN-007: `src/cc_hook.zig` `resolveClaudePidWalk` and `isShellComm`
   tests.
-- REQ-PLUGIN-008: `src/cc_hook.zig` `worktreeStateFromTranscript` tests and
-  compiled-binary `src/e2e.zig` `testCcHookWorktreeIsolationPassthrough`.
+- REQ-PLUGIN-008: `src/cc_hook.zig` `worktreeStateFromTranscript` tests,
+  compiled-binary `src/e2e.zig` `testCcHookWorktreeIsolationPassthrough`, and
+  the live-CLI `scripts/cli-e2e.sh` (`sh -n` in CI; sessions run on demand).
 - REQ-JANITOR-017, REQ-JANITOR-019, REQ-JANITOR-020, REQ-JANITOR-024,
   REQ-JANITOR-025: compiled-binary `src/e2e.zig`
   `testWatchPathDetachedDescendant` default-mode and `--pgroup-only` coverage,

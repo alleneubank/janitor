@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sh -n scripts/release-macos.sh scripts/test-release-automation.sh
+      - run: sh -n scripts/release-macos.sh scripts/test-release-automation.sh scripts/cli-e2e.sh
       - run: sh scripts/test-release-automation.sh
 
   release-macos:
