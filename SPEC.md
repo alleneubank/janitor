@@ -213,6 +213,13 @@ the original child process group.
 - **REQ-PLUGIN-007**: The plugin resolves the `claude` session PID (ancestry
   walk, `comm == "claude"`) and passes it via `--watch-pid`, since neither
   parent-PID nor SessionEnd is reliable on a hard session kill.
+- **REQ-PLUGIN-008**: In a worktree-isolated Claude Code session (`EnterWorktree`
+  or `--worktree`), the hook passes the command through unmodified. Claude
+  Code's isolation guard refuses any wrapper that hands a shell a `-c` string,
+  so wrapping there would block the command rather than supervise it. The hook
+  detects isolation from the latest `worktree-state` record in the session
+  transcript (`transcript_path` in the hook input); a missing or unreadable
+  transcript keeps the wrapping behavior.
 
 ## Invariants
 
@@ -380,6 +387,8 @@ the original child process group.
   (`janitor cc-hook ... 2>/dev/null || true`).
 - REQ-PLUGIN-007: `src/cc_hook.zig` `resolveClaudePidWalk` and `isShellComm`
   tests.
+- REQ-PLUGIN-008: `src/cc_hook.zig` `worktreeStateFromTranscript` tests and
+  compiled-binary `src/e2e.zig` `testCcHookWorktreeIsolationPassthrough`.
 - REQ-JANITOR-017, REQ-JANITOR-019, REQ-JANITOR-020, REQ-JANITOR-024,
   REQ-JANITOR-025: compiled-binary `src/e2e.zig`
   `testWatchPathDetachedDescendant` default-mode and `--pgroup-only` coverage,

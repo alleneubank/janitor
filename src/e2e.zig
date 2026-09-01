@@ -44,6 +44,7 @@ pub fn main() !void {
     defer allocator.free(e2e_exe);
 
     try testVersionCommand(allocator, janitor_exe);
+    try testCcHookWorktreeIsolationPassthrough(allocator, janitor_exe);
     try testTrivialExitSkipsGraceWindow(allocator, janitor_exe);
     try testNormalExit(allocator, janitor_exe);
     try testWatchPathKillsProcessGroup(allocator, janitor_exe);
@@ -304,6 +305,92 @@ fn testVersionCommand(allocator: std.mem.Allocator, janitor_exe: []const u8) !vo
             return error.VersionShaMissing;
         }
     }
+}
+
+// REQ-PLUGIN-008: inside a worktree-isolated Claude Code session the hook must
+// leave the command untouched (no rewrite emitted), because the host's
+// isolation guard refuses janitor's `bash -c` wrapper and would block the
+// command. Once the transcript records that the session left the worktree,
+// wrapping resumes.
+fn testCcHookWorktreeIsolationPassthrough(allocator: std.mem.Allocator, janitor_exe: []const u8) !void {
+    var sandbox = try Sandbox.init(allocator, "cc-hook-worktree");
+    defer sandbox.deinit();
+
+    const user_line = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"sessionId\":\"s1\"}\n";
+    const entered_record =
+        \\{"type":"worktree-state","worktreeSession":{"worktreePath":"/wt/feat"},"sessionId":"s1"}
+        \\
+    ;
+    const exited_record = "{\"type\":\"worktree-state\",\"worktreeSession\":null,\"sessionId\":\"s1\"}\n";
+
+    const isolated_transcript = try sandbox.writeScript("isolated.jsonl", user_line ++ entered_record);
+    defer allocator.free(isolated_transcript);
+    const exited_transcript = try sandbox.writeScript("exited.jsonl", user_line ++ entered_record ++ exited_record);
+    defer allocator.free(exited_transcript);
+
+    const isolated_output = try runCcHookPreToolUse(allocator, janitor_exe, sandbox, isolated_transcript);
+    defer allocator.free(isolated_output);
+    if (isolated_output.len != 0) {
+        std.debug.print("cc-hook rewrote a command inside a worktree-isolated session: {s}\n", .{isolated_output});
+        return error.CcHookWrappedIsolatedSession;
+    }
+
+    const exited_output = try runCcHookPreToolUse(allocator, janitor_exe, sandbox, exited_transcript);
+    defer allocator.free(exited_output);
+    if (std.mem.indexOf(u8, exited_output, "-- 'bash' -c 'gh issue view 1'") == null) {
+        std.debug.print("cc-hook did not wrap after the session left its worktree: {s}\n", .{exited_output});
+        return error.CcHookSkippedWrapAfterExit;
+    }
+}
+
+fn runCcHookPreToolUse(
+    allocator: std.mem.Allocator,
+    janitor_exe: []const u8,
+    sandbox: Sandbox,
+    transcript_path: []const u8,
+) ![]u8 {
+    const hook_input = try std.fmt.allocPrint(
+        allocator,
+        \\{{"session_id":"s1","transcript_path":"{s}","cwd":"/repo","hook_event_name":"PreToolUse",
+        \\ "tool_name":"Bash","tool_input":{{"command":"gh issue view 1"}}}}
+    ,
+        .{transcript_path},
+    );
+    defer allocator.free(hook_input);
+
+    // Route the session lock into the sandbox and drop any ambient JANITOR_CC_*
+    // overrides so the wrapped path is hermetic and never litters the host.
+    const runtime_dir = try std.fs.cwd().realpathAlloc(allocator, sandbox.root);
+    defer allocator.free(runtime_dir);
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+    env.remove("XDG_RUNTIME_DIR");
+    try env.put("TMPDIR", runtime_dir);
+    for ([_][]const u8{
+        "JANITOR_CC_ENABLED",
+        "JANITOR_CC_WRAP_MODE",
+        "JANITOR_CC_SKIP_PATTERNS",
+        "JANITOR_CC_DENY_PATTERNS",
+        "JANITOR_CC_SHELL",
+    }) |name| env.remove(name);
+
+    var child = std.process.Child.init(&.{ janitor_exe, "cc-hook", "pretooluse" }, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.env_map = &env;
+    try child.spawn();
+    try child.stdin.?.writeAll(hook_input);
+    child.stdin.?.close();
+    child.stdin = null;
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+    try child.collectOutput(allocator, &stdout, &stderr, 64 * 1024);
+    try expectExited(try child.wait(), 0, "cc-hook pretooluse exits 0");
+    return stdout.toOwnedSlice(allocator);
 }
 
 // REQ-JANITOR-013: with a controlling terminal, janitor must hand terminal
