@@ -30,6 +30,11 @@ skipped with a diagnostic, so they are outside that guarantee.
 Your command's stdout/stderr, exit code, and `run_in_background` behavior are
 unchanged; `janitor` is transparent.
 
+Worktree-isolated sessions (`EnterWorktree` or `claude --worktree`) are not
+wrapped: Claude Code's isolation guard refuses any wrapper that hands a shell a
+`-c` string, so the hook passes commands through unmodified there instead of
+blocking them. Processes started inside such a session are not drained.
+
 ## Requirements & install
 
 1. Install `janitor` and make sure it is on your `PATH`:

@@ -11,6 +11,16 @@ const default_grace_ms: u64 = 1500;
 const max_hook_input_bytes: usize = 1024 * 1024;
 const max_pid_walk_hops: usize = 8;
 
+// Claude Code appends `{"type":"worktree-state","worktreeSession":<object|null>,
+// "sessionId":...}` to the session transcript on EnterWorktree (object),
+// ExitWorktree (null), and when a resumed session restores its binding, so the
+// latest record is the live isolation state. Nothing else in the hook input or
+// environment marks an isolated session.
+const worktree_state_marker = "\"type\":\"worktree-state\"";
+const max_transcript_bytes: usize = 256 * 1024 * 1024;
+const max_worktree_record_bytes: usize = 64 * 1024;
+const max_worktree_candidate_lines: usize = 16;
+
 pub const default_skip_patterns = [_][]const u8{
     "ls",
     "cat",
@@ -36,9 +46,16 @@ pub const Decision = enum {
     passthrough,
 };
 
+pub const WorktreeState = enum {
+    isolated,
+    not_isolated,
+    unknown,
+};
+
 pub const PreToolUse = struct {
     allocator: std.mem.Allocator,
     session_id: []const u8,
+    transcript_path: []const u8,
     tool_name: []const u8,
     command: []const u8,
     run_in_background: bool,
@@ -47,6 +64,7 @@ pub const PreToolUse = struct {
     // slices needs no mutable borrow at the const call sites.
     pub fn deinit(self: PreToolUse) void {
         self.allocator.free(self.session_id);
+        self.allocator.free(self.transcript_path);
         self.allocator.free(self.tool_name);
         self.allocator.free(self.command);
     }
@@ -130,6 +148,7 @@ pub fn parsePreToolUse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pr
         else => return .{
             .allocator = allocator,
             .session_id = try allocator.dupe(u8, ""),
+            .transcript_path = try allocator.dupe(u8, ""),
             .tool_name = try allocator.dupe(u8, ""),
             .command = try allocator.dupe(u8, ""),
             .run_in_background = false,
@@ -137,6 +156,7 @@ pub fn parsePreToolUse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pr
     };
 
     const session_id = stringField(root, "session_id") orelse "";
+    const transcript_path = stringField(root, "transcript_path") orelse "";
     const tool_name = stringField(root, "tool_name") orelse "";
     var command: []const u8 = "";
     var run_in_background = false;
@@ -152,6 +172,7 @@ pub fn parsePreToolUse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pr
     return .{
         .allocator = allocator,
         .session_id = try allocator.dupe(u8, session_id),
+        .transcript_path = try allocator.dupe(u8, transcript_path),
         .tool_name = try allocator.dupe(u8, tool_name),
         .command = try allocator.dupe(u8, command),
         .run_in_background = run_in_background,
@@ -201,6 +222,57 @@ pub fn decide(input: PreToolUse, config: HookConfig) Decision {
     if (matchesSkip(input.command, config.deny_patterns.values)) return .passthrough;
     if (config.wrap_mode == .background_only and !input.run_in_background) return .passthrough;
     return .wrap;
+}
+
+/// Latest worktree-state record wins. Candidate lines that do not parse as a
+/// record (a truncated append) are skipped, mirroring Claude Code's own reader,
+/// and the search is bounded so a hostile transcript cannot stall the hook.
+pub fn worktreeStateFromTranscript(allocator: std.mem.Allocator, transcript: []const u8) WorktreeState {
+    var search_end = transcript.len;
+    var candidates: usize = 0;
+    while (candidates < max_worktree_candidate_lines) : (candidates += 1) {
+        const marker_at = std.mem.lastIndexOf(u8, transcript[0..search_end], worktree_state_marker) orelse
+            return .not_isolated;
+        const line = lineBounds(transcript, marker_at);
+        switch (parseWorktreeStateLine(allocator, transcript[line.start..line.end])) {
+            .isolated => return .isolated,
+            .not_isolated => return .not_isolated,
+            .unknown => search_end = line.start,
+        }
+    }
+    return .unknown;
+}
+
+const LineBounds = struct { start: usize, end: usize };
+
+fn lineBounds(bytes: []const u8, index: usize) LineBounds {
+    std.debug.assert(index <= bytes.len);
+    const start = if (std.mem.lastIndexOfScalar(u8, bytes[0..index], '\n')) |newline| newline + 1 else 0;
+    const end = std.mem.indexOfScalarPos(u8, bytes, index, '\n') orelse bytes.len;
+    return .{ .start = start, .end = end };
+}
+
+fn parseWorktreeStateLine(allocator: std.mem.Allocator, line: []const u8) WorktreeState {
+    // A real record is a few hundred bytes; a longer line carrying the raw
+    // marker is not one and is not worth parsing.
+    if (line.len > max_worktree_record_bytes) return .unknown;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return .unknown;
+    defer parsed.deinit();
+
+    const record = switch (parsed.value) {
+        .object => |object| object,
+        else => return .unknown,
+    };
+    const record_type = stringField(record, "type") orelse return .unknown;
+    if (!std.mem.eql(u8, record_type, "worktree-state")) return .unknown;
+
+    const session = record.get("worktreeSession") orelse return .unknown;
+    return switch (session) {
+        .object => .isolated,
+        .null => .not_isolated,
+        else => .unknown,
+    };
 }
 
 pub fn matchesSkip(command: []const u8, patterns: []const []const u8) bool {
@@ -322,6 +394,15 @@ fn runPreToolUse(allocator: std.mem.Allocator) !void {
 
     if (decide(input, config) == .passthrough) return;
 
+    // REQ-PLUGIN-008: Claude Code's worktree-isolation guard refuses any wrapper
+    // that hands a shell a -c string, so wrapping here would block the command
+    // instead of supervising it. The transcript is read only once the config
+    // has decided to wrap, so skip-listed commands never pay for it.
+    if (worktreeStateForSession(allocator, input.transcript_path) == .isolated) {
+        log.debug("passthrough: session {s} is worktree-isolated", .{input.session_id});
+        return;
+    }
+
     const lock = ensureLock(allocator, input.session_id);
     defer if (lock) |path| allocator.free(path);
 
@@ -367,6 +448,26 @@ fn parseSessionId(allocator: std.mem.Allocator, json_bytes: []const u8) ![]u8 {
         else => return allocator.dupe(u8, ""),
     };
     return allocator.dupe(u8, stringField(root, "session_id") orelse "");
+}
+
+// An absent, unreadable, or oversized transcript is `unknown`, which keeps
+// today's wrapping behavior; only a positively recorded worktree session
+// changes the decision.
+fn worktreeStateForSession(allocator: std.mem.Allocator, transcript_path: []const u8) WorktreeState {
+    if (transcript_path.len == 0) return .unknown;
+
+    const file = openPath(transcript_path) catch return .unknown;
+    defer file.close();
+
+    const transcript = file.readToEndAlloc(allocator, max_transcript_bytes) catch return .unknown;
+    defer allocator.free(transcript);
+
+    return worktreeStateFromTranscript(allocator, transcript);
+}
+
+fn openPath(path: []const u8) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) return std.fs.openFileAbsolute(path, .{});
+    return std.fs.cwd().openFile(path, .{});
 }
 
 fn ensureLock(allocator: std.mem.Allocator, session_id: []const u8) ?[]u8 {
@@ -560,12 +661,14 @@ fn startsWithPhrase(command: []const u8, phrase: []const u8) bool {
 test "parsePreToolUse extracts bash fields" {
     const allocator = std.testing.allocator;
     const input =
-        \\{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"npm test","run_in_background":true}}
+        \\{"session_id":"s1","transcript_path":"/t/s1.jsonl","tool_name":"Bash",
+        \\ "tool_input":{"command":"npm test","run_in_background":true}}
     ;
     const parsed = try parsePreToolUse(allocator, input);
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("s1", parsed.session_id);
+    try std.testing.expectEqualStrings("/t/s1.jsonl", parsed.transcript_path);
     try std.testing.expectEqualStrings("Bash", parsed.tool_name);
     try std.testing.expectEqualStrings("npm test", parsed.command);
     try std.testing.expect(parsed.run_in_background);
@@ -577,6 +680,7 @@ test "parsePreToolUse defaults missing optional fields" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("", parsed.session_id);
+    try std.testing.expectEqualStrings("", parsed.transcript_path);
     try std.testing.expectEqualStrings("", parsed.tool_name);
     try std.testing.expectEqualStrings("", parsed.command);
     try std.testing.expect(!parsed.run_in_background);
@@ -797,4 +901,54 @@ test "parseConfig reads env values" {
     try std.testing.expectEqualStrings("zsh", config.shell);
     try std.testing.expect(matchesSkip("git branch --show-current", config.skip_patterns.values));
     try std.testing.expect(matchesSkip("vim file", config.deny_patterns.values));
+}
+
+test "worktreeStateFromTranscript reports the latest worktree-state record" {
+    const allocator = std.testing.allocator;
+    const entered =
+        \\{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"s1"}
+        \\{"type":"worktree-state","worktreeSession":{"worktreePath":"/wt/feat"},"sessionId":"s1"}
+        \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"sessionId":"s1"}
+        \\
+    ;
+    try std.testing.expectEqual(WorktreeState.isolated, worktreeStateFromTranscript(allocator, entered));
+
+    const exited = entered ++
+        \\{"type":"worktree-state","worktreeSession":null,"sessionId":"s1"}
+        \\
+    ;
+    try std.testing.expectEqual(WorktreeState.not_isolated, worktreeStateFromTranscript(allocator, exited));
+}
+
+test "worktreeStateFromTranscript treats no record and escaped mentions as not isolated" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(WorktreeState.not_isolated, worktreeStateFromTranscript(allocator, ""));
+    try std.testing.expectEqual(WorktreeState.not_isolated, worktreeStateFromTranscript(allocator,
+        \\{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"s1"}
+        \\
+    ));
+
+    // A tool result quoting a record is JSON-escaped, so the raw marker only
+    // ever matches a real record line; the last real record is the null one.
+    const quoted =
+        \\{"type":"worktree-state","worktreeSession":null,"sessionId":"s1"}
+        \\{"type":"user","message":{"content":"saw {\"type\":\"worktree-state\",\"worktreeSession\":{}}"}}
+        \\
+    ;
+    try std.testing.expectEqual(WorktreeState.not_isolated, worktreeStateFromTranscript(allocator, quoted));
+}
+
+test "worktreeStateFromTranscript skips malformed candidate lines within its bound" {
+    const allocator = std.testing.allocator;
+    const truncated_after_record =
+        \\{"type":"worktree-state","worktreeSession":{"worktreePath":"/x"},"sessionId":"s1"}
+        \\{"type":"worktree-state","worktreeSession":
+    ;
+    try std.testing.expectEqual(WorktreeState.isolated, worktreeStateFromTranscript(allocator, truncated_after_record));
+
+    const only_truncated = "{\"type\":\"worktree-state\",\"worktreeSession\":\n";
+    try std.testing.expectEqual(WorktreeState.not_isolated, worktreeStateFromTranscript(allocator, only_truncated));
+
+    const beyond_bound = only_truncated ** (max_worktree_candidate_lines + 1);
+    try std.testing.expectEqual(WorktreeState.unknown, worktreeStateFromTranscript(allocator, beyond_bound));
 }

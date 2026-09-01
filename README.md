@@ -124,7 +124,14 @@ lock (`--watch-path`) and the Claude session PID (`--watch-pid`). A `SessionEnd`
 hook drops the lock on clean exits.
 
 The hook fails open: if `janitor` is missing, unsupported, or errors, commands
-run unmodified. The plugin supports macOS and Linux only.
+run unmodified. Worktree-isolated sessions (`EnterWorktree`, `--worktree`) are
+passed through unwrapped because Claude Code's isolation guard rejects the
+`bash -c` wrapper. The plugin supports macOS and Linux only.
+
+`scripts/cli-e2e.sh` runs the plugin through a logged-in `claude` CLI in
+restricted mode and checks, per session, whether the Bash tool's command ran
+under `janitor`: wrapped in a plain session, unwrapped after `EnterWorktree`,
+and wrapped again after `ExitWorktree`. It spends a few model turns per case.
 
 Install from the Claude Code plugin marketplace:
 
