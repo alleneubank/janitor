@@ -33,6 +33,9 @@ pub fn main() !void {
     if (args.len == 3 and std.mem.eql(u8, args[1], "--term-escape-fixture")) {
         return runTermEscapeFixture(args[2]);
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--activity-fixture")) {
+        return runActivityFixture(args[2]);
+    }
 
     if (args.len != 2) {
         std.debug.print("usage: e2e <janitor-exe>\n", .{});
@@ -55,6 +58,194 @@ pub fn main() !void {
     try testWatchPathDetachedDescendant(allocator, janitor_exe, e2e_exe, false);
     try testWatchPathDetachedDescendant(allocator, janitor_exe, e2e_exe, true);
     try testWatchPathTermEscapeDescendant(allocator, janitor_exe, e2e_exe);
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        try testActivityFeed(allocator, janitor_exe, e2e_exe);
+    }
+}
+
+fn runActivityFixture(control_path: []const u8) !void {
+    const waiter = try posix.fork();
+    if (waiter != 0) {
+        posix.exit(posix.W.EXITSTATUS(posix.waitpid(waiter, 0).status));
+    }
+    const worker = try posix.fork();
+    if (worker != 0) {
+        posix.exit(posix.W.EXITSTATUS(posix.waitpid(worker, 0).status));
+    }
+    if (std.c.setsid() < 0) return error.SetsidFailed;
+
+    var ignore_term: posix.Sigaction = std.mem.zeroes(posix.Sigaction);
+    ignore_term.handler = .{ .handler = ignoreSignal };
+    ignore_term.mask = posix.sigemptyset();
+    posix.sigaction(posix.SIG.TERM, &ignore_term, null);
+    const control_fd = try connectFixtureControl(control_path, fixture_timeout_ms);
+    defer posix.close(control_fd);
+    var pid: [64]u8 = undefined;
+    try sendControlMessage(control_fd, try std.fmt.bufPrint(&pid, "{d}\n", .{std.c.getpid()}), fixture_timeout_ms);
+
+    try expectActivityCommand(control_fd, 'R');
+    const short_worker = try posix.fork();
+    if (short_worker == 0) {
+        const start = try fixtureCpuTimeNs();
+        while (try fixtureCpuTimeNs() - start < 30 * std.time.ns_per_ms) {}
+        posix.exit(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), posix.waitpid(short_worker, 0).status);
+    try expectActivityCommand(control_fd, 'B');
+
+    const deadline = deadlineAfterMs(5000);
+    while (monotonicNowNs() < deadline) {
+        var byte: [1]u8 = undefined;
+        const received = posix.recv(control_fd, &byte, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (received == 0 or byte[0] == 'C') return;
+        try std.testing.expectEqual(@as(u8, 'S'), byte[0]);
+        // Linux observes a timer with no external process dependency.
+        std.Thread.sleep(5 * std.time.ns_per_s);
+        return;
+    }
+    return error.ActivityFixtureTimedOut;
+}
+
+fn fixtureCpuTimeNs() !u64 {
+    const now = try posix.clock_gettime(.PROCESS_CPUTIME_ID);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
+}
+
+fn expectActivityCommand(fd: posix.fd_t, expected: u8) !void {
+    const deadline = deadlineAfterMs(fixture_timeout_ms);
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const events = try waitForControlEvent(fd, deadline, posix.POLL.IN);
+        if (events & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return error.ControlConnectionFailed;
+        if (events & (posix.POLL.IN | posix.POLL.HUP) == 0) continue;
+        const count = posix.recv(fd, &byte, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (count == 0) return error.ControlConnectionClosed;
+        return std.testing.expectEqual(expected, byte[0]);
+    }
+}
+
+const ActivityFrame = struct {
+    version: u32,
+    seq: u64,
+    elapsedMs: u64,
+    coverage: enum { complete, uncertain },
+    cpuAdvanced: bool,
+    state: enum { unknown, blocked, unresolved_wait, runnable },
+};
+
+const ActivityReader = struct {
+    fd: posix.fd_t,
+    last_seq: u64 = 0,
+    last_ms: u64 = 0,
+
+    fn next(self: *ActivityReader, deadline: u64) !ActivityFrame {
+        var line: [256]u8 = undefined;
+        var used: usize = 0;
+        while (used < line.len) {
+            const events = try waitForControlEvent(self.fd, deadline, posix.POLL.IN);
+            if (events & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return error.ControlConnectionFailed;
+            if (events & (posix.POLL.IN | posix.POLL.HUP) == 0) continue;
+            const count = posix.recv(self.fd, line[used..][0..1], 0) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (count == 0) return error.ControlConnectionClosed;
+            if (line[used] == '\n') {
+                const parsed = try std.json.parseFromSlice(ActivityFrame, std.heap.smp_allocator, line[0..used], .{});
+                defer parsed.deinit();
+                const frame = parsed.value;
+                try std.testing.expectEqual(@as(u32, 1), frame.version);
+                try std.testing.expect(frame.seq > self.last_seq);
+                try std.testing.expect(frame.elapsedMs > self.last_ms);
+                self.last_seq = frame.seq;
+                self.last_ms = frame.elapsedMs;
+                return frame;
+            }
+            used += 1;
+        }
+        return error.ActivityFrameTooLong;
+    }
+
+    const Observation = enum { external_wait, reaped_cpu, live_cpu, timer_wait };
+
+    fn expect(self: *ActivityReader, observation: Observation) !ActivityFrame {
+        const deadline = deadlineAfterMs(fixture_timeout_ms);
+        while (true) {
+            const frame = try self.next(deadline);
+            const matches = switch (observation) {
+                .external_wait => frame.coverage == .complete and
+                    frame.state == .unresolved_wait and !frame.cpuAdvanced,
+                .reaped_cpu => frame.state == .unresolved_wait and frame.cpuAdvanced,
+                .live_cpu => frame.coverage == .complete and frame.state == .runnable and frame.cpuAdvanced,
+                .timer_wait => frame.coverage == .complete and !frame.cpuAdvanced and
+                    frame.state == (if (builtin.os.tag == .linux) .blocked else .unresolved_wait),
+            };
+            if (matches) return frame;
+        }
+    }
+};
+
+fn testActivityFeed(allocator: std.mem.Allocator, janitor_exe: []const u8, e2e_exe: []const u8) !void {
+    var sandbox = try Sandbox.init(allocator, "activity");
+    defer sandbox.deinit();
+    const activity_path = try sandbox.path("activity.sock");
+    defer allocator.free(activity_path);
+    const control_path = try sandbox.path("workload.sock");
+    defer allocator.free(control_path);
+    var listener = try FixtureControlListener.init(activity_path);
+    defer listener.deinit();
+    var worker_listener = try FixtureControlListener.init(control_path);
+    defer worker_listener.deinit();
+
+    const args = &.{
+        janitor_exe,              "--grace-ms", "120", "--activity-socket", activity_path,
+        "--activity-interval-ms", "250",        "--",  e2e_exe,             "--activity-fixture",
+        control_path,
+    };
+    var janitor = std.process.Child.init(args, allocator);
+    janitor.stdin_behavior = .Ignore;
+    janitor.stdout_behavior = .Ignore;
+    try janitor.spawn();
+    var reaped = false;
+    defer if (!reaped) {
+        _ = reapFixtureJanitor(&janitor);
+    };
+
+    var feed = try listener.acceptWithin(fixture_timeout_ms);
+    var feed_open = true;
+    defer if (feed_open) feed.close();
+    var worker = try worker_listener.acceptWithin(fixture_timeout_ms);
+    defer worker.close();
+    _ = try worker.receiveDiagnosticPid(fixture_timeout_ms);
+    var reader: ActivityReader = .{ .fd = feed.fd };
+    const waiting = try reader.expect(.external_wait);
+    try sendControlMessage(worker.fd, "R", fixture_timeout_ms);
+    const reaped_cpu = try reader.expect(.reaped_cpu);
+    try sendControlMessage(worker.fd, "B", fixture_timeout_ms);
+    const live_cpu = try reader.expect(.live_cpu);
+    try sendControlMessage(worker.fd, "S", fixture_timeout_ms);
+    const timer_wait = try reader.expect(.timer_wait);
+
+    feed.close();
+    feed_open = false;
+    // After the reader disappears, Janitor still owns the workload. The
+    // connected escaped child can disappear only on teardown or fixture exit.
+    try std.testing.expectError(error.Timeout, worker.waitForExit(350));
+    signalFixtureProcess(janitor.id, posix.SIG.TERM, "SIGTERM");
+    const term = try waitForChildTerm(&janitor, fixture_timeout_ms, "activity cancellation");
+    reaped = true;
+    try expectExited(term, 128 + posix.SIG.TERM, "activity cancellation preserves child status");
+    try worker.waitForExit(fixture_timeout_ms);
+    std.debug.print(
+        "activity feed elapsed ms: external wait {d}, reaped CPU {d}, live CPU {d}, timer wait {d}\n",
+        .{ waiting.elapsedMs, reaped_cpu.elapsedMs, live_cpu.elapsedMs, timer_wait.elapsedMs },
+    );
 }
 
 // This fixture intentionally lives in the e2e executable rather than Janitor:

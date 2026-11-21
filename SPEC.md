@@ -95,8 +95,8 @@ the original child process group.
 - **REQ-JANITOR-011**: On Linux, parent exit, child exit, watched-path deletion,
   watched-PID exit, and shutdown signals are watched through `epoll` over
   `pidfd`, `signalfd`, and `inotify`.
-- **REQ-JANITOR-012**: Supported event backends do not wake periodically while
-  idle; timeout waits are used only for the configured teardown grace window.
+- **REQ-JANITOR-012**: Supported event backends wake on watched events,
+  the configured teardown grace deadline, or an opted-in activity sample.
 - **REQ-JANITOR-013**: When `janitor`'s standard input is a terminal, `janitor`
   transfers terminal foreground ownership (`tcsetpgrp`) to the child process
   group after the child is spawned, so an interactive child receives keyboard
@@ -169,6 +169,12 @@ the original child process group.
   DragonFly, observing child exit reaps the group leader; Janitor then latches
   numeric group signaling off rather than risk a recycled PGID, accepting any
   remaining group cleanup breadth it can no longer safely provide.
+- **REQ-JANITOR-027**: The opt-in [activity feed](README.md#activity-feed)
+  reports bounded, identity-checked CPU and thread observations for the
+  reserved group and still-linked descendants. It excludes executor
+  bookkeeping, includes reaped-child CPU, and preserves uncertainty.
+- **REQ-JANITOR-028**: The feed uses a separate nonblocking connection and
+  grants no signal authority. Reader loss leaves ordinary teardown available.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, applies a credential-free ad-hoc signature, packages
   README and LICENSE beside the binary, extracts the archive, and verifies the
@@ -369,6 +375,9 @@ the original child process group.
 - REQ-JANITOR-010, REQ-JANITOR-011, REQ-JANITOR-012: `src/root.zig` watcher
   backend selection, plus native and cross-target builds.
 - REQ-JANITOR-013: `src/e2e.zig` `testInteractiveForegroundHandoff`.
+- REQ-JANITOR-027, REQ-JANITOR-028: `src/e2e.zig` `testActivityFeed`
+  exercises escaped descendants, reaped CPU, unresolved waits, and teardown
+  after reader disconnect. `src/activity.zig` covers a replaced PID.
 - REQ-RELEASE-001, REQ-RELEASE-002, REQ-RELEASE-003, REQ-RELEASE-004:
   `scripts/release-macos.sh`, `sh -n scripts/release-macos.sh`, and
   `scripts/release-macos.sh --dry-run --target aarch64-macos`.

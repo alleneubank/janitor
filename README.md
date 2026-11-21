@@ -55,7 +55,8 @@ JANITOR_INSTALL_FROM_SOURCE=1 ./install.sh
 ## Usage
 
 ```sh
-janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] [--pgroup-only] -- CMD [ARGS...]
+janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS] [--poll-ms MS] \
+        [--pgroup-only] [--activity-socket PATH [--activity-interval-ms MS]] -- CMD [ARGS...]
 janitor version | --version | -V
 ```
 
@@ -89,6 +90,48 @@ and only individually signals an escaped descendant after platform identity
 verification proves it is the captured process. Use `--pgroup-only` to opt out
 and retain the historical behavior that drains only the original child process
 group.
+
+### Activity feed
+
+On Linux and macOS, a caller can listen on a Unix stream socket in a private
+directory and pass its path as `--activity-socket PATH`. Janitor connects
+before launch and keeps the connection closed to the executor. The default
+cadence is 5,000 ms. `--activity-interval-ms` accepts 25–5,000 ms and requires
+the socket option. Use snapshot draining with the feed.
+
+The direct command serves as an executor that launches the workload and
+waits for it. Janitor observes the reserved group and the executor's
+identity-verified descendants, including still-linked descendants that create
+another session. It excludes the executor's own CPU and thread state and
+includes CPU accumulated from reaped children.
+
+Each newline-delimited JSON record has this shape.
+
+```json
+{"version":1,"seq":2,"elapsedMs":10000,"coverage":"complete","cpuAdvanced":false,"state":"blocked"}
+```
+
+- `seq` starts at 1 and advances per scheduled observation. `elapsedMs` is
+  monotonic time since Janitor connected, measured when sampling finishes.
+- `coverage` is `complete` or `uncertain`. Establishing a baseline, a
+  changed process set, missing reads, exhausted budgets, and late samples
+  can all leave an interval uncertain.
+- `cpuAdvanced` reports an increase in at least one attributable CPU
+  counter, including user or system time from reaped children.
+- `state` is `runnable` if an observed workload thread is runnable,
+  `unresolved_wait` if a wait could depend on an external process or I/O,
+  `blocked` if all observed live workload threads have a known blocked or
+  stopped state, or `unknown` if the workload could not be observed.
+  Linux can recognize some local waits through `/proc`. macOS libproc
+  exposes scheduling state but no wait reason, so ordinary sleeping threads
+  are reported as `unresolved_wait`.
+
+A consumer can establish an idle interval only from timely consecutive
+complete, blocked records without CPU advances and its own separate command
+output observation. A sequence gap, stale data, an unfinished JSON line, or
+socket closure breaks that evidence. A slow or disconnected reader cannot
+delay Janitor's teardown. The feed carries aggregate observations and the
+caller decides when to request a stop.
 
 ## Platform Behavior
 

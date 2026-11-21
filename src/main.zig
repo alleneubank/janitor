@@ -81,10 +81,14 @@ fn printUsage(err: ?janitor.ParseError) void {
     ;
     std.debug.print(
         \\usage: janitor [--watch-path PATH] [--watch-pid PID] [--grace-ms MS]
-        \\               [--poll-ms MS] [--pgroup-only] -- CMD [ARGS...]
+        \\               [--poll-ms MS] [--pgroup-only]
+        \\               [--activity-socket PATH [--activity-interval-ms MS]] -- CMD [ARGS...]
         \\   or: janitor version | --version | -V
         \\
         \\{s}
+        \\
+        \\On Linux and macOS, --activity-socket sends aggregate descendant activity
+        \\to a private Unix stream socket. Activity never triggers a stop on its own.
         \\
     , .{teardown_description});
 }

@@ -38,6 +38,13 @@ pub const ProcessRecord = struct {
     pub fn isEscaped(self: ProcessRecord, original_pgid: posix.pid_t) bool {
         return self.pgid != original_pgid;
     }
+
+    fn bindParent(child: ProcessRecord, parent: ProcessIdentity) ?ProcessRecord {
+        if (child.ppid != parent.pid) return null;
+        var bound = child;
+        bound.parent_identity = parent;
+        return bound;
+    }
 };
 
 /// The answer to a process-group membership walk. This deliberately answers a
@@ -449,6 +456,284 @@ pub fn captureIdentity(pid: posix.pid_t) ?ProcessIdentity {
     };
 }
 
+pub const CpuTime = struct {
+    user: u64 = 0,
+    system: u64 = 0,
+    child_user: u64 = 0,
+    child_system: u64 = 0,
+
+    fn childrenOnly(self: CpuTime) CpuTime {
+        return .{ .child_user = self.child_user, .child_system = self.child_system };
+    }
+};
+
+/// The scheduler can show an interruptible wait without identifying who can
+/// satisfy it. Preserve that distinction so an external dependency can't be
+/// mistaken for a blocked workload.
+pub const WaitState = enum {
+    blocked,
+    unresolved_wait,
+    runnable,
+
+    fn merge(self: WaitState, other: WaitState) WaitState {
+        return @enumFromInt(@max(@intFromEnum(self), @intFromEnum(other)));
+    }
+};
+
+pub const ProcessObservation = struct {
+    identity: ProcessIdentity,
+    cpu: CpuTime,
+    /// The executor and zombies have accounting but no workload threads.
+    state: ?WaitState,
+};
+
+const max_workload_processes = 1024;
+const max_linux_processes = 16384;
+const max_threads = 1024;
+
+const ObservationBudget = struct {
+    start: std.time.Instant,
+    limit_ns: u64,
+
+    fn check(self: ObservationBudget) error{ObservationUnavailable}!void {
+        const now = std.time.Instant.now() catch return error.ObservationUnavailable;
+        if (now.since(self.start) >= self.limit_ns) return error.ObservationUnavailable;
+    }
+};
+
+/// The observer starts with the reserved group's leader, follows only verified
+/// parent links, then adds any other members of that group. It only carries
+/// process metadata. Stop discovery obtains its own signal capabilities.
+pub fn observeWorkload(
+    allocator: std.mem.Allocator,
+    root: ProcessIdentity,
+    start: std.time.Instant,
+    limit_ns: u64,
+) ![]ProcessObservation {
+    const budget: ObservationBudget = .{ .start = start, .limit_ns = limit_ns };
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    var walker = switch (comptime builtin.os.tag) {
+        .linux => try LinuxObservationWalk.init(temporary, budget),
+        .macos => DarwinObservationWalk{ .budget = budget },
+        else => return error.ObservationUnavailable,
+    };
+    defer walker.deinit();
+
+    const leader = try walker.read(root.pid);
+    if (!leader.identity.eql(root) or leader.pgid != root.pid) return error.ObservationUnavailable;
+    var scope: ObservationScope = .{};
+    try scope.add(temporary, leader);
+    var next: usize = 0;
+    while (next < scope.records.items.len) : (next += 1) {
+        try budget.check();
+        try walker.children(temporary, &scope, scope.records.items[next]);
+    }
+    try walker.group(temporary, &scope, root.pid);
+
+    const observations = try allocator.alloc(ProcessObservation, scope.records.items.len);
+    errdefer allocator.free(observations);
+    for (scope.records.items, observations) |record, *observation| {
+        try budget.check();
+        observation.* = try walker.observe(record, record.identity.eql(root));
+    }
+    try budget.check();
+    return observations;
+}
+
+const ObservationScope = struct {
+    records: std.ArrayList(ProcessRecord) = .empty,
+    indices: std.AutoHashMapUnmanaged(posix.pid_t, usize) = .empty,
+
+    fn add(self: *ObservationScope, allocator: std.mem.Allocator, record: ProcessRecord) !void {
+        if (self.indices.get(record.identity.pid)) |index| {
+            const earlier = self.records.items[index];
+            // Repeated group and ancestry leads must agree on membership.
+            if (!sameProcessAndLinks(earlier, record)) return error.ObservationUnavailable;
+        } else {
+            if (self.records.items.len == max_workload_processes) return error.ObservationUnavailable;
+            try self.indices.put(allocator, record.identity.pid, self.records.items.len);
+            try self.records.append(allocator, record);
+        }
+    }
+};
+
+fn sameProcessAndLinks(left: ProcessRecord, right: ProcessRecord) bool {
+    return left.identity.eql(right.identity) and left.ppid == right.ppid and left.pgid == right.pgid;
+}
+
+fn confirmObservationParent(walker: anytype, record: ProcessRecord) !void {
+    if (record.parent_identity) |parent| {
+        const current = try walker.read(parent.pid);
+        if (!current.identity.eql(parent)) return error.ObservationUnavailable;
+    }
+}
+
+const LinuxObservationWalk = struct {
+    proc: std.fs.Dir,
+    records: []const ProcessRecord,
+    budget: ObservationBudget,
+
+    fn init(allocator: std.mem.Allocator, budget: ObservationBudget) !LinuxObservationWalk {
+        var proc = try std.fs.openDirAbsolute("/proc", .{ .iterate = true });
+        errdefer proc.close();
+        var records: std.ArrayList(ProcessRecord) = .empty;
+        var entries = proc.iterate();
+        while (try entries.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            const pid = std.fmt.parseUnsigned(posix.pid_t, entry.name, 10) catch continue;
+            try budget.check();
+            if (records.items.len == max_linux_processes) return error.ObservationUnavailable;
+            var process = proc.openDir(entry.name, .{}) catch |err| switch (err) {
+                error.FileNotFound, error.ProcessNotFound => continue,
+                else => return err,
+            };
+            defer process.close();
+            const stat = readLinuxStatFile(process) catch |err| switch (err) {
+                error.FileNotFound, error.ProcessNotFound => continue,
+                else => return err,
+            };
+            if (stat.record.identity.pid != pid) return error.ObservationUnavailable;
+            try records.append(allocator, stat.record);
+        }
+        std.mem.sortUnstable(ProcessRecord, records.items, {}, lessByParent);
+        return .{ .proc = proc, .records = records.items, .budget = budget };
+    }
+
+    fn deinit(self: *LinuxObservationWalk) void {
+        self.proc.close();
+        self.* = undefined;
+    }
+
+    fn lessByParent(_: void, left: ProcessRecord, right: ProcessRecord) bool {
+        return left.ppid < right.ppid;
+    }
+
+    fn compareParent(pid: posix.pid_t, record: ProcessRecord) std.math.Order {
+        return std.math.order(pid, record.ppid);
+    }
+
+    fn open(self: LinuxObservationWalk, pid: posix.pid_t) !std.fs.Dir {
+        var name: [32]u8 = undefined;
+        return self.proc.openDir(try std.fmt.bufPrint(&name, "{d}", .{pid}), .{});
+    }
+
+    fn read(self: LinuxObservationWalk, pid: posix.pid_t) !ProcessRecord {
+        var process = try self.open(pid);
+        defer process.close();
+        return (try readLinuxStatFile(process)).record;
+    }
+
+    fn children(
+        self: LinuxObservationWalk,
+        allocator: std.mem.Allocator,
+        scope: *ObservationScope,
+        parent: ProcessRecord,
+    ) !void {
+        const first = std.sort.lowerBound(ProcessRecord, self.records, parent.identity.pid, compareParent);
+        for (self.records[first..]) |lead| {
+            if (lead.ppid != parent.identity.pid) break;
+            try scope.add(allocator, lead.bindParent(parent.identity) orelse unreachable);
+        }
+    }
+
+    fn group(
+        self: LinuxObservationWalk,
+        allocator: std.mem.Allocator,
+        scope: *ObservationScope,
+        pgid: posix.pid_t,
+    ) !void {
+        for (self.records) |record| {
+            if (record.pgid == pgid) try scope.add(allocator, record);
+        }
+    }
+
+    fn observe(self: LinuxObservationWalk, expected: ProcessRecord, executor: bool) !ProcessObservation {
+        try confirmObservationParent(self, expected);
+        var process = try self.open(expected.identity.pid);
+        defer process.close();
+        const before = try readLinuxStatFile(process);
+        if (!sameProcessAndLinks(before.record, expected)) return error.ObservationUnavailable;
+        const state = if (executor or before.state == 'Z') null else try self.threadState(process, before.threads);
+        const after = try readLinuxStatFile(process);
+        if (!sameProcessAndLinks(after.record, expected)) return error.ObservationUnavailable;
+        if (!executor and (after.threads != before.threads or (after.state == 'Z') != (before.state == 'Z'))) {
+            return error.ObservationUnavailable;
+        }
+        try confirmObservationParent(self, expected);
+        return .{
+            .identity = expected.identity,
+            .cpu = if (executor) after.cpu.childrenOnly() else after.cpu,
+            .state = state,
+        };
+    }
+
+    fn threadState(self: LinuxObservationWalk, process: std.fs.Dir, expected: usize) !WaitState {
+        if (expected == 0 or expected > max_threads) return error.ObservationUnavailable;
+        var tasks = try process.openDir("task", .{ .iterate = true });
+        defer tasks.close();
+        var entries = tasks.iterate();
+        var count: usize = 0;
+        var state: WaitState = .blocked;
+        while (try entries.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            try self.budget.check();
+            count += 1;
+            if (count > expected) return error.ObservationUnavailable;
+            var thread = try tasks.openDir(entry.name, .{});
+            defer thread.close();
+            const before = try readLinuxStatFile(thread);
+            const observed = try linuxThreadState(thread, before.state);
+            const after = try readLinuxStatFile(thread);
+            if (!before.record.identity.eql(after.record.identity)) return error.ObservationUnavailable;
+            state = state.merge(observed);
+            if (before.state != after.state) state = state.merge(.unresolved_wait);
+        }
+        if (count != expected) return error.ObservationUnavailable;
+        return state;
+    }
+};
+
+fn linuxThreadState(thread: std.fs.Dir, state: u8) !WaitState {
+    return switch (state) {
+        'R' => .runnable,
+        'T' => .blocked,
+        'S' => linuxSleepState(thread),
+        else => .unresolved_wait,
+    };
+}
+
+fn linuxSleepState(thread: std.fs.Dir) !WaitState {
+    var wchan = try thread.openFile("wchan", .{});
+    defer wchan.close();
+    var buffer: [128]u8 = undefined;
+    const length = try wchan.readAll(&buffer);
+    const name = std.mem.trim(u8, buffer[0..length], "\n");
+    if (std.mem.eql(u8, name, "do_wait") or std.mem.eql(u8, name, "hrtimer_nanosleep")) return .blocked;
+    if (std.mem.startsWith(u8, name, "futex_wait")) return linuxFutexState(thread);
+    return .unresolved_wait;
+}
+
+fn linuxFutexState(thread: std.fs.Dir) !WaitState {
+    // A shared futex can be satisfied by a process outside the subtree.
+    var syscall = try thread.openFile("syscall", .{});
+    defer syscall.close();
+    var buffer: [256]u8 = undefined;
+    const length = try syscall.readAll(&buffer);
+    var fields = std.mem.tokenizeAny(u8, buffer[0..length], " \n");
+    const number = std.fmt.parseUnsigned(usize, fields.next() orelse return .unresolved_wait, 10) catch
+        return .unresolved_wait;
+    const Syscall = std.os.linux.SYS;
+    const futex = if (@hasField(Syscall, "futex")) Syscall.futex else Syscall.futex_time64;
+    if (number != @intFromEnum(futex)) return .unresolved_wait;
+    _ = fields.next() orelse return .unresolved_wait; // futex address
+    const operation = std.fmt.parseUnsigned(usize, fields.next() orelse return .unresolved_wait, 0) catch
+        return .unresolved_wait;
+    const futex_private_flag = 128; // linux/futex.h
+    return if (operation & futex_private_flag != 0) .blocked else .unresolved_wait;
+}
+
 /// `/proc` entry metadata captured before opening the directory. The inode is
 /// compared with `fstat`-equivalent metadata from the retained FD so a numeric
 /// directory name cannot silently hand off to a replacement process.
@@ -507,6 +792,8 @@ pub fn parseLinuxStat(input: []const u8) ?ProcessRecord {
 const LinuxStat = struct {
     record: ProcessRecord,
     state: u8,
+    cpu: CpuTime,
+    threads: usize,
 };
 
 fn parseLinuxStatWithState(input: []const u8) ?LinuxStat {
@@ -521,23 +808,27 @@ fn parseLinuxStatWithState(input: []const u8) ?LinuxStat {
     const ppid = std.fmt.parseInt(posix.pid_t, ppid_text, 10) catch return null;
     const pgid = std.fmt.parseInt(posix.pid_t, pgid_text, 10) catch return null;
 
-    var start_time: ?u64 = null;
-    // Fields after state begin at stat field 4. Start time is field 22, hence
-    // index 18 in this suffix; ppid and pgid consumed indexes 0 and 1.
-    var index: usize = 2;
-    while (fields.next()) |field| : (index += 1) {
-        if (index == 18) {
-            start_time = std.fmt.parseInt(u64, field, 10) catch return null;
-            break;
-        }
-    }
+    // Fields 6–13 precede the four CPU counters at fields 14–17.
+    for (6..14) |_| _ = fields.next() orelse return null;
+    const cpu: CpuTime = .{
+        .user = std.fmt.parseUnsigned(u64, fields.next() orelse return null, 10) catch return null,
+        .system = std.fmt.parseUnsigned(u64, fields.next() orelse return null, 10) catch return null,
+        .child_user = std.fmt.parseUnsigned(u64, fields.next() orelse return null, 10) catch return null,
+        .child_system = std.fmt.parseUnsigned(u64, fields.next() orelse return null, 10) catch return null,
+    };
+    for (18..20) |_| _ = fields.next() orelse return null;
+    const threads = std.fmt.parseUnsigned(usize, fields.next() orelse return null, 10) catch return null;
+    _ = fields.next() orelse return null; // itrealvalue (field 21)
+    const start_time = std.fmt.parseUnsigned(u64, fields.next() orelse return null, 10) catch return null;
     return .{
         .record = .{
-            .identity = .{ .pid = pid, .start_token = start_time orelse return null },
+            .identity = .{ .pid = pid, .start_token = start_time },
             .ppid = ppid,
             .pgid = pgid,
         },
         .state = input[close + 2],
+        .cpu = cpu,
+        .threads = threads,
     };
 }
 
@@ -689,7 +980,7 @@ fn captureLinuxTarget(
         if (!record.identity.eql(provisional.identity) or record.ppid != provisional.ppid) return .incomplete;
         const parent_after = try readLinuxStat(parent) orelse return .incomplete;
         if (!parent_after.identity.eql(parent_before.identity)) return .incomplete;
-        record.parent_identity = parent_before.identity;
+        record = record.bindParent(parent_before.identity) orelse return .incomplete;
     }
 
     const target = try allocateTarget(allocator, record, .{ .linux_proc_dir = process.fd });
@@ -722,10 +1013,10 @@ fn linuxProcEntryIdentityFromStatx(
         std.os.linux.STATX_TYPE | std.os.linux.STATX_INO,
         &metadata,
     );
-    switch (posix.errno(result)) {
+    switch (std.os.linux.E.init(result)) {
         .SUCCESS => {},
-        else => {
-            _ = try linuxAcquisitionDispositionFromErrno(posix.errno(result));
+        else => |err| {
+            _ = try linuxAcquisitionDispositionFromErrno(err);
             return null;
         },
     }
@@ -740,18 +1031,27 @@ fn readLinuxStat(process: std.fs.Dir) LinuxAcquireError!?ProcessRecord {
     return stat.record;
 }
 
+test "lookup of a disappeared proc entry leaves discovery incomplete" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var proc = try std.fs.openDirAbsolute("/proc", .{});
+    defer proc.close();
+    try std.testing.expectEqual(null, try linuxProcEntryIdentityAt(proc.fd, "janitor-test-missing-pid"));
+}
+
 fn readLinuxStatWithState(process: std.fs.Dir) LinuxAcquireError!?LinuxStat {
-    var stat = process.openFile("stat", .{}) catch |err| {
+    return readLinuxStatFile(process) catch |err| {
+        if (err == error.InvalidProcStat) return null;
         _ = try linuxAcquisitionDispositionFromError(err);
         return null;
     };
+}
+
+fn readLinuxStatFile(process: std.fs.Dir) !LinuxStat {
+    var stat = try process.openFile("stat", .{});
     defer stat.close();
     var buffer: [4096]u8 = undefined;
-    const bytes = stat.readAll(&buffer) catch |err| {
-        _ = try linuxAcquisitionDispositionFromError(err);
-        return null;
-    };
-    return parseLinuxStatWithState(buffer[0..bytes]);
+    const bytes = try stat.readAll(&buffer);
+    return parseLinuxStatWithState(buffer[0..bytes]) orelse error.InvalidProcStat;
 }
 
 const LinuxAcquisitionDisposition = enum { incomplete };
@@ -793,7 +1093,8 @@ fn linuxAcquisitionDispositionFromError(
 
 fn linuxSignalResult(fd: posix.fd_t, signal: u8) TargetResult {
     if (comptime builtin.os.tag != .linux) return .unsupported;
-    return signalResultFromErrno(posix.errno(std.os.linux.pidfd_send_signal(fd, @intCast(signal), null, 0)), signal);
+    const rc = std.os.linux.pidfd_send_signal(fd, @intCast(signal), null, 0);
+    return signalResultFromErrno(std.os.linux.E.init(rc), signal);
 }
 
 fn linuxTargetRecord(fd: posix.fd_t) ?ProcessRecord {
@@ -861,6 +1162,169 @@ extern "c" fn __error() *c_int;
 
 const proc_pidtbsdinfo = 3;
 const proc_pgrp_only = 2;
+const proc_ppid_only = 6;
+
+// sys/resource.h rusage_info_v1. This flavor includes accumulated CPU from
+// reaped children as well as the process's own user and system time.
+const DarwinRusage = extern struct {
+    uuid: [16]u8,
+    user: u64,
+    system: u64,
+    package_idle_wakeups: u64,
+    interrupt_wakeups: u64,
+    pageins: u64,
+    wired_size: u64,
+    resident_size: u64,
+    physical_footprint: u64,
+    start_abstime: u64,
+    exit_abstime: u64,
+    child_user: u64,
+    child_system: u64,
+    child_package_idle_wakeups: u64,
+    child_interrupt_wakeups: u64,
+    child_pageins: u64,
+};
+extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *DarwinRusage) c_int;
+
+// sys/proc_info.h and mach/thread_info.h.
+const DarwinThreadInfo = extern struct {
+    user_time: u64,
+    system_time: u64,
+    cpu_usage: i32,
+    policy: i32,
+    run_state: i32,
+    flags: i32,
+    sleep_time: i32,
+    current_priority: i32,
+    priority: i32,
+    max_priority: i32,
+    name: [64]u8,
+};
+const proc_pidthreadinfo = 5;
+const proc_pidlistthreads = 6;
+const rusage_info_v1 = 1;
+const proc_zombie = 5;
+const th_state_running = 1;
+const th_state_stopped = 3;
+
+const DarwinObservationWalk = struct {
+    budget: ObservationBudget,
+
+    fn deinit(self: *DarwinObservationWalk) void {
+        self.* = undefined;
+    }
+
+    fn read(_: DarwinObservationWalk, pid: posix.pid_t) !ProcessRecord {
+        return darwinRecord(darwinBsdInfo(pid, true) orelse return error.ObservationUnavailable);
+    }
+
+    fn children(
+        self: DarwinObservationWalk,
+        allocator: std.mem.Allocator,
+        scope: *ObservationScope,
+        parent: ProcessRecord,
+    ) !void {
+        const before = try self.read(parent.identity.pid);
+        if (!sameProcessAndLinks(before, parent)) return error.ObservationUnavailable;
+        var pids: [max_workload_processes + 1]posix.pid_t = undefined;
+        for (try darwinPids(proc_ppid_only, parent.identity.pid, &pids)) |pid| {
+            try self.budget.check();
+            const child = try self.read(pid);
+            // PROC_PPID_ONLY can also return a ptraced process by its
+            // pre-trace PPID. It is a lead, never a replacement for the link.
+            try scope.add(allocator, child.bindParent(parent.identity) orelse return error.ObservationUnavailable);
+        }
+        const after = try self.read(parent.identity.pid);
+        if (!sameProcessAndLinks(after, parent)) return error.ObservationUnavailable;
+    }
+
+    fn group(
+        self: DarwinObservationWalk,
+        allocator: std.mem.Allocator,
+        scope: *ObservationScope,
+        pgid: posix.pid_t,
+    ) !void {
+        var pids: [max_workload_processes + 1]posix.pid_t = undefined;
+        const members = try darwinPids(proc_pgrp_only, pgid, &pids);
+        if (members.len == 0) return error.ObservationUnavailable;
+        for (members) |pid| {
+            try self.budget.check();
+            const record = try self.read(pid);
+            if (record.pgid != pgid) return error.ObservationUnavailable;
+            try scope.add(allocator, record);
+        }
+    }
+
+    fn observe(self: DarwinObservationWalk, expected: ProcessRecord, executor: bool) !ProcessObservation {
+        const pid = expected.identity.pid;
+        try confirmObservationParent(self, expected);
+        const before = darwinBsdInfo(pid, true) orelse return error.ObservationUnavailable;
+        if (!sameProcessAndLinks(darwinRecord(before), expected)) return error.ObservationUnavailable;
+        const state = if (executor or before.status == proc_zombie) null else try self.threadState(pid);
+        var counters: DarwinRusage = undefined;
+        if (proc_pid_rusage(pid, rusage_info_v1, &counters) != 0) return error.ObservationUnavailable;
+        const after = darwinBsdInfo(pid, true) orelse return error.ObservationUnavailable;
+        if (!sameProcessAndLinks(darwinRecord(after), expected) or before.status != after.status) {
+            return error.ObservationUnavailable;
+        }
+        try confirmObservationParent(self, expected);
+        const cpu: CpuTime = .{
+            .user = counters.user,
+            .system = counters.system,
+            .child_user = counters.child_user,
+            .child_system = counters.child_system,
+        };
+        return .{ .identity = expected.identity, .cpu = if (executor) cpu.childrenOnly() else cpu, .state = state };
+    }
+
+    fn threadState(self: DarwinObservationWalk, pid: posix.pid_t) !WaitState {
+        var threads: [max_threads + 1]u64 = undefined;
+        const handles = try darwinThreads(pid, &threads);
+        var state: WaitState = .blocked;
+        for (handles) |handle| {
+            try self.budget.check();
+            var info: DarwinThreadInfo = undefined;
+            const bytes = proc_pidinfo(pid, proc_pidthreadinfo, handle, &info, @sizeOf(DarwinThreadInfo));
+            if (bytes != @sizeOf(DarwinThreadInfo)) return error.ObservationUnavailable;
+            state = state.merge(switch (info.run_state) {
+                th_state_running => .runnable,
+                th_state_stopped => .blocked,
+                // libproc exposes scheduler state but no wait reason. A
+                // sleeping thread may be waiting on a socket or Mach IPC.
+                else => .unresolved_wait,
+            });
+        }
+        var recheck: [max_threads + 1]u64 = undefined;
+        const after = try darwinThreads(pid, &recheck);
+        if (!std.mem.eql(u64, handles, after)) return error.ObservationUnavailable;
+        return state;
+    }
+};
+
+fn darwinPids(
+    filter: c_uint,
+    id: posix.pid_t,
+    buffer: *[max_workload_processes + 1]posix.pid_t,
+) ![]const posix.pid_t {
+    __error().* = 0;
+    const bytes = proc_listpids(filter, @intCast(id), buffer, @sizeOf(@TypeOf(buffer.*)));
+    if (bytes == 0 and darwinThreadErrno() == .SUCCESS) return buffer[0..0];
+    const count = darwinPidCountFromByteCount(bytes) orelse return error.ObservationUnavailable;
+    if (count >= buffer.len) return error.ObservationUnavailable;
+    return buffer[0..count];
+}
+
+fn darwinThreads(pid: posix.pid_t, buffer: *[max_threads + 1]u64) ![]const u64 {
+    const bytes = proc_pidinfo(pid, proc_pidlistthreads, 0, buffer, @sizeOf(@TypeOf(buffer.*)));
+    if (bytes <= 0 or @rem(bytes, @sizeOf(u64)) != 0) return error.ObservationUnavailable;
+    const count: usize = @intCast(@divExact(bytes, @sizeOf(u64)));
+    if (count >= buffer.len) return error.ObservationUnavailable;
+    std.mem.sortUnstable(u64, buffer[0..count], {}, std.sort.asc(u64));
+    for (buffer[0 .. count - 1], buffer[1..count]) |first, second| {
+        if (first == second) return error.ObservationUnavailable;
+    }
+    return buffer[0..count];
+}
 
 /// `proc_listpids(PROC_PGRP_ONLY, ...)` is the Darwin membership authority.
 /// Its kernel-side PGID filter avoids inspecting unrelated process records,
@@ -1010,9 +1474,14 @@ fn captureDarwinOne(pid: posix.pid_t) ?ProcessIdentity {
 }
 
 fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
+    const info = darwinBsdInfo(pid, false) orelse return null;
+    return darwinRecord(info);
+}
+
+fn darwinBsdInfo(pid: posix.pid_t, include_zombies: bool) ?ProcBsdInfo {
     if (comptime builtin.os.tag != .macos) return null;
     var info: ProcBsdInfo = undefined;
-    const returned = proc_pidinfo(pid, proc_pidtbsdinfo, 0, @ptrCast(&info), @sizeOf(ProcBsdInfo));
+    const returned = proc_pidinfo(pid, proc_pidtbsdinfo, @intFromBool(include_zombies), &info, @sizeOf(ProcBsdInfo));
     const errno_code = darwinThreadErrno();
     switch (darwinProcPidInfoDisposition(returned, errno_code)) {
         .complete => {},
@@ -1021,8 +1490,15 @@ fn captureDarwinRecord(pid: posix.pid_t) ?ProcessRecord {
         .disappeared, .unavailable => return null,
     }
     if (info.pid != @as(u32, @intCast(pid))) return null;
+    return info;
+}
+
+fn darwinRecord(info: ProcBsdInfo) ProcessRecord {
     return .{
-        .identity = .{ .pid = pid, .start_token = (@as(u128, info.start_tvsec) << 64) | info.start_tvusec },
+        .identity = .{
+            .pid = @intCast(info.pid),
+            .start_token = (@as(u128, info.start_tvsec) << 64) | info.start_tvusec,
+        },
         .ppid = @intCast(info.ppid),
         .pgid = @intCast(info.pgid),
     };
@@ -1050,12 +1526,11 @@ fn captureDarwinBoundRecord(pid: posix.pid_t) ?ProcessRecord {
     const provisional = captureDarwinRecord(pid) orelse return null;
     if (provisional.ppid <= 0) return provisional;
     const parent_before = captureDarwinRecord(provisional.ppid) orelse return null;
-    var record = captureDarwinRecord(pid) orelse return null;
+    const record = captureDarwinRecord(pid) orelse return null;
     if (!record.identity.eql(provisional.identity) or record.ppid != provisional.ppid) return null;
     const parent_after = captureDarwinRecord(provisional.ppid) orelse return null;
     if (!parent_after.identity.eql(parent_before.identity)) return null;
-    record.parent_identity = parent_before.identity;
-    return record;
+    return record.bindParent(parent_before.identity);
 }
 
 fn darwinTargetRecord(identity: ProcessIdentity) ?ProcessRecord {

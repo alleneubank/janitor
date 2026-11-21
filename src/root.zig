@@ -2,6 +2,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const activity = @import("activity.zig");
 const process_tree = @import("process_tree.zig");
 // Build-time metadata: version single-sourced from build.zig.zon, git_sha
 // resolved during `zig build`. See build.zig.
@@ -31,12 +32,15 @@ pub fn versionLine(buf: []u8) std.fmt.BufPrintError![]const u8 {
 const default_grace_ms: u64 = 1500;
 const default_poll_ms: u64 = 100;
 
+pub const ActivityConfig = activity.Config;
+
 pub const Config = struct {
     watch_path: ?[]const u8 = null,
     watch_pid: ?posix.pid_t = null,
     grace_ms: u64 = default_grace_ms,
     poll_ms: u64 = default_poll_ms,
     drain_scope: DrainScope = .snapshot,
+    activity_feed: ?ActivityConfig = null,
     command: []const []const u8,
 };
 
@@ -51,6 +55,7 @@ pub const ParseError = error{
     MissingCommand,
     MissingOptionValue,
     InvalidNumber,
+    InvalidActivityConfig,
     UnknownOption,
 };
 
@@ -58,6 +63,7 @@ pub const RunError = error{
     UnsupportedPlatform,
     SpawnFailed,
     WaitFailed,
+    ActivityFeedUnavailable,
 };
 
 const ChildState = union(enum) {
@@ -103,6 +109,8 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
     var grace_ms = default_grace_ms;
     var poll_ms = default_poll_ms;
     var drain_scope: DrainScope = .snapshot;
+    var activity_socket: ?[]const u8 = null;
+    var activity_interval_ms: ?u64 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -110,12 +118,20 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
         if (std.mem.eql(u8, arg, "--")) {
             const command = args[i + 1 ..];
             if (command.len == 0) return error.MissingCommand;
+            const activity_feed: ?ActivityConfig = if (activity_socket) |socket_path| .{
+                .socket_path = socket_path,
+                .interval_ms = activity_interval_ms orelse activity.default_interval_ms,
+            } else null;
+            if (activity_feed) |feed| {
+                if (!feed.valid() or drain_scope != .snapshot) return error.InvalidActivityConfig;
+            } else if (activity_interval_ms != null) return error.InvalidActivityConfig;
             return .{
                 .watch_path = watch_path,
                 .watch_pid = watch_pid,
                 .grace_ms = grace_ms,
                 .poll_ms = poll_ms,
                 .drain_scope = drain_scope,
+                .activity_feed = activity_feed,
                 .command = command,
             };
         } else if (std.mem.eql(u8, arg, "--watch-path")) {
@@ -138,6 +154,14 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             poll_ms = std.fmt.parseUnsigned(u64, args[i], 10) catch return error.InvalidNumber;
         } else if (std.mem.eql(u8, arg, "--pgroup-only")) {
             drain_scope = .pgroup_only;
+        } else if (std.mem.eql(u8, arg, "--activity-socket")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            activity_socket = args[i];
+        } else if (std.mem.eql(u8, arg, "--activity-interval-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            activity_interval_ms = std.fmt.parseUnsigned(u64, args[i], 10) catch return error.InvalidNumber;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return error.MissingCommand;
         } else {
@@ -152,6 +176,13 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.UnsupportedPlatform;
 
     const original_parent = getParentPid();
+    var feed: ?activity.Feed = if (config.activity_feed) |requested| blk: {
+        if (!descendants_supported or config.drain_scope != .snapshot or !requested.valid()) {
+            return error.ActivityFeedUnavailable;
+        }
+        break :blk activity.Feed.connect(requested, allocator) catch return error.ActivityFeedUnavailable;
+    } else null;
+    defer if (feed) |*observer| observer.close();
 
     var child = std.process.Child.init(config.command, allocator);
     child.stdin_behavior = .Inherit;
@@ -174,13 +205,15 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
         config.watch_pid,
     ) catch return error.WaitFailed;
     defer watcher.deinit();
+    if (feed) |*observer| observer.arm(child_pid);
 
     if (getParentPid() != original_parent) {
         return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .parent_exited);
     }
 
     while (true) {
-        const event = watcher.wait(null) catch return error.WaitFailed;
+        const wait_ms = if (feed) |*observer| observer.waitMs() else null;
+        const event = watcher.wait(wait_ms) catch return error.WaitFailed;
         switch (event) {
             .parent_exited => return teardown(
                 allocator,
@@ -225,9 +258,28 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
 
                 return reapChild(child_pid, &child_state);
             },
-            .timeout => unreachable,
+            .timeout => if (feed) |*observer| observer.sample() else unreachable,
         }
     }
+}
+
+test {
+    _ = activity;
+}
+
+test "activity feed options require a socket and snapshot draining" {
+    const config = try parseArgs(&.{ "--activity-socket", "feed.sock", "--", "true" });
+    const feed = config.activity_feed orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("feed.sock", feed.socket_path);
+    try std.testing.expectEqual(@as(u64, 5000), feed.interval_ms);
+
+    const invalid = [_][]const []const u8{
+        &.{ "--activity-interval-ms", "100", "--", "true" },
+        &.{ "--activity-socket", "", "--", "true" },
+        &.{ "--activity-socket", "feed.sock", "--activity-interval-ms", "0", "--", "true" },
+        &.{ "--pgroup-only", "--activity-socket", "feed.sock", "--", "true" },
+    };
+    for (invalid) |args| try std.testing.expectError(error.InvalidActivityConfig, parseArgs(args));
 }
 
 fn teardown(
@@ -976,7 +1028,7 @@ fn observeChildLinux(child_pid: posix.pid_t) ?u8 {
     while (true) {
         var info = std.mem.zeroes(linux.siginfo_t);
         const rc = linux.waitid(.PID, child_pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
-        const errno_code = posix.errno(rc);
+        const errno_code = linux.E.init(rc);
         switch (waitidErrnoAction(errno_code)) {
             .success => {},
             .retry => continue,
@@ -1146,7 +1198,7 @@ fn tcGetForeground(fd: posix.fd_t) ?posix.pid_t {
             var pgrp: posix.pid_t = undefined;
             while (true) {
                 const rc = std.os.linux.tcgetpgrp(fd, &pgrp);
-                switch (posix.errno(rc)) {
+                switch (std.os.linux.E.init(rc)) {
                     .SUCCESS => return pgrp,
                     .INTR => continue,
                     else => return null,
@@ -1183,7 +1235,7 @@ fn tcSetForeground(fd: posix.fd_t, pgid: posix.pid_t) bool {
             var pgrp = pgid;
             while (true) {
                 const rc = std.os.linux.tcsetpgrp(fd, &pgrp);
-                switch (posix.errno(rc)) {
+                switch (std.os.linux.E.init(rc)) {
                     .SUCCESS => return true,
                     .INTR => continue,
                     else => return false,
@@ -1573,7 +1625,7 @@ const LinuxWatcher = struct {
 
     fn linuxPidfdOpen(pid: posix.pid_t) !posix.fd_t {
         const rc = linux.pidfd_open(pid, 0);
-        switch (posix.errno(rc)) {
+        switch (linux.E.init(rc)) {
             .SUCCESS => return @intCast(rc),
             .SRCH => return error.ProcessNotFound,
             .INVAL => unreachable,
