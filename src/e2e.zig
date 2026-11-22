@@ -96,20 +96,21 @@ fn runActivityFixture(control_path: []const u8, activity_path: []const u8) !void
     var pid: [64]u8 = undefined;
     try sendControlMessage(control_fd, try std.fmt.bufPrint(&pid, "{d}\n", .{std.c.getpid()}), fixture_timeout_ms);
 
-    try expectActivityCommand(control_fd, 'B');
+    if (!try expectActivityCommand(control_fd, 'B', null)) return;
 
-    const deadline = deadlineAfterMs(5000);
-    while (monotonicNowNs() < deadline) {
+    // The harness owns the phase deadline. A peer close ends the fixture
+    // even when the harness fails before sending the next command.
+    while (true) {
         var byte: [1]u8 = undefined;
         const received = posix.recv(control_fd, &byte, 0) catch |err| switch (err) {
             error.WouldBlock => continue,
+            error.ConnectionResetByPeer => return,
             else => return err,
         };
         if (received == 0 or byte[0] == 'C') return;
         try std.testing.expectEqual(@as(u8, 'S'), byte[0]);
         deadlockFixture();
     }
-    return error.ActivityFixtureTimedOut;
 }
 
 fn expectNoActivitySocket(activity_path: []const u8) !void {
@@ -140,7 +141,7 @@ fn runReapedFixture(control_path: []const u8) !void {
     if (guard == 0) deadlockFixture();
     const control_fd = try connectFixtureControl(control_path, fixture_timeout_ms);
     defer posix.close(control_fd);
-    try expectActivityCommand(control_fd, 'R');
+    if (!try expectActivityCommand(control_fd, 'R', null)) return;
     const short_worker = try posix.fork();
     if (short_worker == 0) {
         const start = try fixtureCpuTimeNs();
@@ -149,7 +150,7 @@ fn runReapedFixture(control_path: []const u8) !void {
     }
     try std.testing.expectEqual(@as(u32, 0), posix.waitpid(short_worker, 0).status);
     try sendControlMessage(control_fd, "A", fixture_timeout_ms);
-    try expectActivityCommand(control_fd, 'C');
+    _ = try expectActivityCommand(control_fd, 'C', null);
 }
 
 fn fixtureCpuTimeNs() !u64 {
@@ -157,19 +158,27 @@ fn fixtureCpuTimeNs() !u64 {
     return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
 }
 
-fn expectActivityCommand(fd: posix.fd_t, expected: u8) !void {
-    const deadline = deadlineAfterMs(fixture_timeout_ms);
+/// Fixture peers block on readiness without spending CPU to check a clock.
+/// The harness uses a deadline for its own expectations and closes its
+/// socket on every exit path, which also releases a waiting fixture.
+fn expectActivityCommand(fd: posix.fd_t, expected: u8, deadline: ?u64) !bool {
+    var readiness = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     var byte: [1]u8 = undefined;
     while (true) {
-        const events = try waitForControlEvent(fd, deadline, posix.POLL.IN);
+        const events = if (deadline) |limit| try waitForControlEvent(fd, limit, posix.POLL.IN) else blocked: {
+            _ = try posix.poll(&readiness, -1);
+            break :blocked readiness[0].revents;
+        };
         if (events & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return error.ControlConnectionFailed;
         if (events & (posix.POLL.IN | posix.POLL.HUP) == 0) continue;
         const count = posix.recv(fd, &byte, 0) catch |err| switch (err) {
             error.WouldBlock => continue,
+            error.ConnectionResetByPeer => return false,
             else => return err,
         };
-        if (count == 0) return error.ControlConnectionClosed;
-        return std.testing.expectEqual(expected, byte[0]);
+        if (count == 0) return false;
+        try std.testing.expectEqual(expected, byte[0]);
+        return true;
     }
 }
 
@@ -184,8 +193,7 @@ const ActivityFrame = struct {
 
 const ActivityReader = struct {
     fd: posix.fd_t,
-    last_seq: u64 = 0,
-    last_ms: u64 = 0,
+    last_frame: ?ActivityFrame = null,
 
     fn next(self: *ActivityReader, deadline: u64) !ActivityFrame {
         var line: [256]u8 = undefined;
@@ -204,10 +212,14 @@ const ActivityReader = struct {
                 defer parsed.deinit();
                 const frame = parsed.value;
                 try std.testing.expectEqual(@as(u32, 1), frame.version);
-                try std.testing.expect(frame.seq > self.last_seq);
-                try std.testing.expect(frame.elapsedMs > self.last_ms);
-                self.last_seq = frame.seq;
-                self.last_ms = frame.elapsedMs;
+                if (self.last_frame) |last| {
+                    try std.testing.expect(frame.seq > last.seq);
+                    try std.testing.expect(frame.elapsedMs > last.elapsedMs);
+                } else {
+                    try std.testing.expect(frame.seq > 0);
+                    try std.testing.expect(frame.elapsedMs > 0);
+                }
+                self.last_frame = frame;
                 return frame;
             }
             used += 1;
@@ -220,8 +232,21 @@ const ActivityReader = struct {
     fn expect(self: *ActivityReader, observation: Observation) !ActivityFrame {
         const deadline = deadlineAfterMs(6000);
         var consecutive: usize = 0;
+        errdefer {
+            if (self.last_frame) |last| {
+                std.debug.print(
+                    "activity observation {s} failed. Last frame {d} at {d}ms: {s}, {s}, cpuAdvanced={any}\n",
+                    .{
+                        @tagName(observation),   last.seq,             last.elapsedMs,
+                        @tagName(last.coverage), @tagName(last.state), last.cpuAdvanced,
+                    },
+                );
+            } else {
+                std.debug.print("activity observation {s} failed before the first frame\n", .{@tagName(observation)});
+            }
+        }
         while (true) {
-            const prior = self.last_seq;
+            const prior = if (self.last_frame) |last| last.seq else 0;
             const frame = try self.next(deadline);
             const matches = switch (observation) {
                 .external_wait => frame.coverage == .complete and
@@ -273,13 +298,13 @@ fn testActivityFeed(allocator: std.mem.Allocator, janitor_exe: []const u8, e2e_e
     defer worker.close();
     _ = try worker.receiveDiagnosticPid(fixture_timeout_ms);
     var reader: ActivityReader = .{ .fd = feed.fd };
+    const waiting = try reader.expect(.external_wait);
     var sibling = try startActivityRun(allocator, janitor_exe, &sandbox, "sibling.sock", "250", &.{
         "sh", "-c", "(while :; do :; done) & wait",
     });
     defer sibling.deinit();
     var sibling_reader: ActivityReader = .{ .fd = sibling.feed.fd };
     _ = try sibling_reader.expect(.live_cpu);
-    const waiting = try reader.expect(.external_wait);
     try sendControlMessage(worker.fd, "B", fixture_timeout_ms);
     const live_cpu = try reader.expect(.live_cpu);
     try sendControlMessage(worker.fd, "S", fixture_timeout_ms);
@@ -380,7 +405,9 @@ fn testReapedCpu(allocator: std.mem.Allocator, janitor_exe: []const u8, e2e_exe:
     var reader: ActivityReader = .{ .fd = job.feed.fd };
     _ = try reader.expect(.quiet_deadlock);
     try sendControlMessage(executor.fd, "R", fixture_timeout_ms);
-    try expectActivityCommand(executor.fd, 'A'); // waitpid completed
+    if (!try expectActivityCommand(executor.fd, 'A', deadlineAfterMs(fixture_timeout_ms))) {
+        return error.ControlConnectionClosed;
+    }
     // Only the guard remains and it was already blocked. Janitor excludes
     // the direct executor's own CPU, so advancement can only be child CPU
     // accumulated by waitpid in the executor.
@@ -448,7 +475,7 @@ fn runThreadGroupFixture(executor_path: []const u8, worker_path: []const u8) !vo
     }
     const executor = try connectFixtureControl(executor_path, fixture_timeout_ms);
     defer posix.close(executor);
-    try expectActivityCommand(executor, 'E');
+    if (!try expectActivityCommand(executor, 'E', null)) return;
     posix.exit(37);
 }
 
@@ -467,16 +494,16 @@ fn runSurvivingThread(path: []const u8) !void {
     const control = try connectFixtureControl(path, fixture_timeout_ms);
     defer posix.close(control);
     try sendControlMessage(control, "A", fixture_timeout_ms);
-    const busy_deadline = deadlineAfterMs(8000);
-    while (monotonicNowNs() < busy_deadline) {
+    while (true) {
         var byte: [1]u8 = undefined;
         const received = posix.recv(control, &byte, 0) catch |err| switch (err) {
             error.WouldBlock => continue,
+            error.ConnectionResetByPeer => return,
             else => return err,
         };
         if (received == 0) return;
+        return error.UnexpectedFixtureControlData;
     }
-    return error.SurvivingThreadTimedOut;
 }
 
 fn testThreadGroupLeaderExit(allocator: std.mem.Allocator, janitor_exe: []const u8, e2e_exe: []const u8) !void {
@@ -498,7 +525,9 @@ fn testThreadGroupLeaderExit(allocator: std.mem.Allocator, janitor_exe: []const 
     defer executor.close();
     var worker = try worker_listener.acceptWithin(fixture_timeout_ms);
     defer worker.close();
-    try expectActivityCommand(worker.fd, 'A');
+    if (!try expectActivityCommand(worker.fd, 'A', deadlineAfterMs(fixture_timeout_ms))) {
+        return error.ControlConnectionClosed;
+    }
     var reader: ActivityReader = .{ .fd = job.feed.fd };
     _ = try reader.expect(.live_cpu);
     try sendControlMessage(executor.fd, "E", fixture_timeout_ms);
