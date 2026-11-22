@@ -811,10 +811,27 @@ fn linuxSleepState(thread: std.fs.Dir) !WaitState {
     defer wchan.close();
     var buffer: [128]u8 = undefined;
     const length = try wchan.readAll(&buffer);
-    const name = std.mem.trim(u8, buffer[0..length], "\n");
+    const name = std.mem.sliceTo(std.mem.trim(u8, buffer[0..length], "\n"), '.');
     if (std.mem.eql(u8, name, "do_wait") or std.mem.eql(u8, name, "hrtimer_nanosleep")) return .blocked;
-    if (std.mem.startsWith(u8, name, "futex_wait")) return linuxFutexState(thread);
+    if (isLinuxFutexWaitChannel(name)) return linuxFutexState(thread);
     return .unresolved_wait;
+}
+
+fn isLinuxFutexWaitChannel(name: []const u8) bool {
+    // Linux 7.0 calls schedule() from futex_do_wait. Older kernels use
+    // futex_wait_queue or futex_wait_queue_me. A compiler can inline these
+    // into the enclosing wait function.
+    const wait_functions = [_][]const u8{
+        "futex_do_wait", "futex_wait_queue", "futex_wait_queue_me", "__futex_wait", "futex_wait",
+    };
+    for (wait_functions) |function| if (std.mem.eql(u8, name, function)) return true;
+    return false;
+}
+
+test "recognize Linux futex wait channels across kernel versions" {
+    try std.testing.expect(isLinuxFutexWaitChannel("futex_wait_queue"));
+    try std.testing.expect(isLinuxFutexWaitChannel("futex_do_wait"));
+    try std.testing.expect(!isLinuxFutexWaitChannel("futex_wait_multiple"));
 }
 
 fn linuxFutexState(thread: std.fs.Dir) !WaitState {
