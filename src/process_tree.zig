@@ -561,7 +561,9 @@ fn collectObservationScope(
     var next: usize = 0;
     while (next < scope.records.items.len) : (next += 1) {
         try budget.check();
-        try walker.children(allocator, &scope, scope.records.items[next]);
+        // Appending children can move the records buffer. Pass the index so
+        // the walker never holds a borrowed record across an append.
+        try walker.children(allocator, &scope, next);
     }
     try walker.group(allocator, &scope, root.pid);
     return scope;
@@ -661,12 +663,14 @@ const LinuxObservationWalk = struct {
         self: LinuxObservationWalk,
         allocator: std.mem.Allocator,
         scope: *ObservationScope,
-        parent: ProcessRecord,
+        parent_index: usize,
     ) !void {
-        const first = std.sort.lowerBound(ProcessRecord, self.records, parent.identity.pid, compareParent);
+        const parent_pid = scope.records.items[parent_index].identity.pid;
+        const first = std.sort.lowerBound(ProcessRecord, self.records, parent_pid, compareParent);
         for (self.records[first..]) |lead| {
-            if (lead.ppid != parent.identity.pid) break;
-            try scope.add(allocator, lead.bindParent(parent.identity) orelse unreachable);
+            if (lead.ppid != parent_pid) break;
+            const child = lead.bindParent(scope.records.items[parent_index].identity) orelse unreachable;
+            try scope.add(allocator, child);
         }
     }
 
@@ -1343,20 +1347,22 @@ const DarwinObservationWalk = struct {
         self: DarwinObservationWalk,
         allocator: std.mem.Allocator,
         scope: *ObservationScope,
-        parent: ProcessRecord,
+        parent_index: usize,
     ) !void {
-        const before = try self.read(parent.identity.pid);
-        if (!sameProcessAndLinks(before, parent)) return error.ObservationUnavailable;
+        const parent_pid = scope.records.items[parent_index].identity.pid;
+        const before = try self.read(parent_pid);
+        if (!sameProcessAndLinks(before, scope.records.items[parent_index])) return error.ObservationUnavailable;
         var pids: [max_workload_processes + 1]posix.pid_t = undefined;
-        for (try darwinPids(proc_ppid_only, parent.identity.pid, &pids)) |pid| {
+        for (try darwinPids(proc_ppid_only, parent_pid, &pids)) |pid| {
             try self.budget.check();
             const child = try self.read(pid);
             // PROC_PPID_ONLY can also return a ptraced process by its
             // pre-trace PPID. It is a lead, never a replacement for the link.
-            try scope.add(allocator, child.bindParent(parent.identity) orelse return error.ObservationUnavailable);
+            const bound = child.bindParent(before.identity) orelse return error.ObservationUnavailable;
+            try scope.add(allocator, bound);
         }
-        const after = try self.read(parent.identity.pid);
-        if (!sameProcessAndLinks(after, parent)) return error.ObservationUnavailable;
+        const after = try self.read(parent_pid);
+        if (!sameProcessAndLinks(after, before)) return error.ObservationUnavailable;
     }
 
     fn group(
