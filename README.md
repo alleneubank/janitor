@@ -115,7 +115,9 @@ Each newline-delimited JSON record has this shape.
   monotonic time since Janitor connected, measured when sampling finishes.
 - `coverage` is `complete` or `uncertain`. Establishing a baseline, a
   changed process set, missing reads, exhausted budgets, and late samples
-  can all leave an interval uncertain.
+  can all leave an interval uncertain. Janitor checks scoped membership
+  before and after accounting. Restricted Linux proc visibility, including
+  `hidepid` modes that can hide an owned process, leaves coverage uncertain.
 - `cpuAdvanced` reports an increase in at least one attributable CPU
   counter, including user or system time from reaped children.
 - `state` is `runnable` if an observed workload thread is runnable,
@@ -129,9 +131,10 @@ Each newline-delimited JSON record has this shape.
 A consumer can establish an idle interval only from timely consecutive
 complete, blocked records without CPU advances and its own separate command
 output observation. A sequence gap, stale data, an unfinished JSON line, or
-socket closure breaks that evidence. A slow or disconnected reader cannot
-delay Janitor's teardown. The feed carries aggregate observations and the
-caller decides when to request a stop.
+socket closure breaks that evidence. The sampler runs independently of
+teardown, including when a process read waits in the kernel or the reader
+stops draining the socket. The feed carries aggregate observations and the
+consumer decides when to request an idle stop.
 
 ## Platform Behavior
 

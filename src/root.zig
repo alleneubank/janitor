@@ -180,7 +180,7 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
         if (!descendants_supported or config.drain_scope != .snapshot or !requested.valid()) {
             return error.ActivityFeedUnavailable;
         }
-        break :blk activity.Feed.connect(requested, allocator) catch return error.ActivityFeedUnavailable;
+        break :blk activity.Feed.connect(requested) catch return error.ActivityFeedUnavailable;
     } else null;
     defer if (feed) |*observer| observer.close();
 
@@ -207,60 +207,29 @@ pub fn run(config: Config, allocator: std.mem.Allocator) RunError!u8 {
     defer watcher.deinit();
     if (feed) |*observer| observer.arm(child_pid);
 
-    if (getParentPid() != original_parent) {
-        return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .parent_exited);
-    }
-
-    while (true) {
-        const wait_ms = if (feed) |*observer| observer.waitMs() else null;
-        const event = watcher.wait(wait_ms) catch return error.WaitFailed;
-        switch (event) {
-            .parent_exited => return teardown(
-                allocator,
-                child_pid,
-                child_pgid,
-                config,
-                &watcher,
-                &child_state,
-                .parent_exited,
-            ),
-            .watched_pid_exited => return teardown(
-                allocator,
-                child_pid,
-                child_pgid,
-                config,
-                &watcher,
-                &child_state,
-                .watched_pid_exited,
-            ),
-            .path_missing => return teardown(
-                allocator,
-                child_pid,
-                child_pgid,
-                config,
-                &watcher,
-                &child_state,
-                .path_missing,
-            ),
-            .signal => return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .signal),
-            .child_exited => {
+    const reason: TeardownReason = if (getParentPid() != original_parent) .parent_exited else while (true) {
+        const event = watcher.wait(null) catch return error.WaitFailed;
+        break switch (event) {
+            .parent_exited => .parent_exited,
+            .watched_pid_exited => .watched_pid_exited,
+            .path_missing => .path_missing,
+            .signal => .signal,
+            .child_exited => observed: {
                 if (!tryPollChild(child_pid, &child_state)) continue;
-                // On Linux/Darwin the exited group leader is deliberately held
-                // as a zombie to reserve its PGID.  `kill(-pgid, 0)` therefore
-                // sees the reservation itself; only another live member makes
-                // this a real teardown.
-                const action = childExitAction(
-                    originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state),
-                );
-                if (action == .teardown) {
-                    return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, .child_exited);
-                }
-
-                return reapChild(child_pid, &child_state);
+                break :observed .child_exited;
             },
-            .timeout => if (feed) |*observer| observer.sample() else unreachable,
-        }
+            .timeout => unreachable,
+        };
+    };
+    if (feed) |*observer| observer.close();
+
+    if (reason == .child_exited) {
+        // Linux and macOS retain the direct child's zombie as a PGID
+        // reservation. Only another live member requires a teardown.
+        const members = originalGroupHasLiveMember(allocator, child_pid, child_pgid, child_state);
+        if (childExitAction(members) != .teardown) return reapChild(child_pid, &child_state);
     }
+    return teardown(allocator, child_pid, child_pgid, config, &watcher, &child_state, reason);
 }
 
 test {

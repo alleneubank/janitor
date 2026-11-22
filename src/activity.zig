@@ -7,6 +7,7 @@ const posix = std.posix;
 
 // Zig 0.15's Linux F namespace omits F_DUPFD_CLOEXEC (linux/fcntl.h).
 const dupfd_cloexec = if (builtin.os.tag == .linux) 1030 else posix.F.DUPFD_CLOEXEC;
+const socket_send_buffer_bytes: c_int = 4096;
 
 pub const default_interval_ms: u64 = 5000;
 pub const min_interval_ms: u64 = 25;
@@ -33,20 +34,12 @@ const Frame = struct {
 };
 
 pub const Feed = struct {
-    // A slow observation must not monopolize the watch loop. An interval
-    // shorter than this ceiling also gets its own proportional work budget.
-    const max_sample_ns = 100 * std.time.ns_per_ms;
-
-    allocator: std.mem.Allocator,
     fd: ?posix.fd_t,
     epoch: std.time.Instant,
     interval_ns: u64,
-    next_ns: u64,
-    sequence: u64 = 0,
-    root: ?tree.ProcessIdentity = null,
-    previous: ?[]tree.ProcessObservation = null,
+    worker: ?*Worker = null,
 
-    pub fn connect(config: Config, allocator: std.mem.Allocator) !Feed {
+    pub fn connect(config: Config) !Feed {
         const address = try std.net.Address.initUnix(config.socket_path);
         const socket = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
         const fd = if (socket <= posix.STDERR_FILENO) blk: {
@@ -55,42 +48,137 @@ pub const Feed = struct {
             break :blk @as(posix.fd_t, @intCast(duplicate));
         } else socket;
         errdefer posix.close(fd);
+        // Keep queued observations close to the reader's current window.
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&socket_send_buffer_bytes));
         try posix.connect(fd, &address.any, address.getOsSockLen());
         return .{
-            .allocator = allocator,
             .fd = fd,
             .epoch = try std.time.Instant.now(),
             .interval_ns = config.interval_ms * std.time.ns_per_ms,
-            .next_ns = config.interval_ms * std.time.ns_per_ms,
         };
     }
 
     pub fn arm(self: *Feed, executor: posix.pid_t) void {
-        self.root = tree.captureIdentity(executor);
+        self.worker = Worker.start(self.*, executor) catch {
+            self.close();
+            return;
+        };
     }
 
     pub fn close(self: *Feed) void {
-        if (self.fd) |fd| posix.close(fd);
+        const fd = self.fd orelse return;
+        self.fd = null;
+        if (self.worker) |worker| {
+            // A proc read can still be in the kernel. Terminate the socket
+            // immediately and let the worker retire using its own resources.
+            shutdownSocket(fd);
+            worker.stop();
+            worker.release();
+            self.worker = null;
+        }
+        posix.close(fd);
+    }
+};
+
+fn shutdownSocket(fd: posix.fd_t) void {
+    posix.shutdown(fd, .both) catch |err| switch (err) {
+        error.SocketNotConnected => {},
+        else => std.log.debug("activity socket shutdown failed: {s}", .{@errorName(err)}),
+    };
+}
+
+// One worker per Janitor process also bounds detached work when the library
+// is used repeatedly and a prior proc read is still stuck in the kernel.
+var sampler_running = std.atomic.Value(bool).init(false);
+
+const Worker = struct {
+    const allocator = std.heap.smp_allocator;
+
+    references: std.atomic.Value(u8) = .init(2),
+    mutex: std.Thread.Mutex = .{},
+    wake: std.Thread.Condition = .{},
+    stopping: bool = false,
+    sampler: Sampler,
+
+    fn start(feed: Feed, executor: posix.pid_t) !*Worker {
+        if (sampler_running.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.ActivityUnavailable;
+        errdefer sampler_running.store(false, .release);
+
+        const observer = try allocator.create(Worker);
+        errdefer allocator.destroy(observer);
+        const duplicate = try posix.fcntl(feed.fd.?, dupfd_cloexec, posix.STDERR_FILENO + 1);
+        const fd: posix.fd_t = @intCast(duplicate);
+        errdefer posix.close(fd);
+        observer.* = .{ .sampler = .{
+            .fd = fd,
+            .epoch = feed.epoch,
+            .interval_ns = feed.interval_ns,
+            .next_ns = feed.interval_ns,
+            .root = tree.captureIdentity(executor),
+        } };
+        const sampler = try std.Thread.spawn(.{}, run, .{observer});
+        sampler.detach();
+        return observer;
+    }
+
+    fn run(self: *Worker) void {
+        defer self.release();
+        defer sampler_running.store(false, .release);
+        defer self.sampler.close();
+        while (self.sampler.fd != null and self.waitUntilDue()) self.sampler.sample();
+    }
+
+    fn waitUntilDue(self: *Worker) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.stopping) {
+            const now = std.time.Instant.now() catch return false;
+            const remaining = self.sampler.next_ns -| now.since(self.sampler.epoch);
+            if (remaining == 0) return true;
+            self.wake.timedWait(&self.mutex, remaining) catch continue;
+        }
+        return false;
+    }
+
+    fn stop(self: *Worker) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.stopping = true;
+        self.wake.signal();
+    }
+
+    fn release(self: *Worker) void {
+        if (self.references.fetchSub(1, .acq_rel) == 1) allocator.destroy(self);
+    }
+};
+
+const Sampler = struct {
+    const allocator = std.heap.smp_allocator;
+    const max_sample_ns = 100 * std.time.ns_per_ms;
+
+    fd: ?posix.fd_t,
+    epoch: std.time.Instant,
+    interval_ns: u64,
+    next_ns: u64,
+    root: ?tree.ProcessIdentity,
+    sequence: u64 = 0,
+    previous: ?[]tree.ProcessObservation = null,
+
+    fn close(self: *Sampler) void {
+        if (self.fd) |fd| {
+            shutdownSocket(fd);
+            posix.close(fd);
+        }
         self.fd = null;
         self.setBaseline(null);
     }
 
-    fn setBaseline(self: *Feed, observations: ?[]tree.ProcessObservation) void {
-        if (self.previous) |old| self.allocator.free(old);
+    fn setBaseline(self: *Sampler, observations: ?[]tree.ProcessObservation) void {
+        if (self.previous) |old| allocator.free(old);
         self.previous = observations;
     }
 
-    pub fn waitMs(self: *Feed) ?u64 {
-        if (self.fd == null) return null;
-        const now = std.time.Instant.now() catch {
-            self.close();
-            return null;
-        };
-        const remaining = self.next_ns -| now.since(self.epoch);
-        return std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch unreachable;
-    }
-
-    pub fn sample(self: *Feed) void {
+    fn sample(self: *Sampler) void {
         const fd = self.fd orelse return;
         const start = std.time.Instant.now() catch {
             self.close();
@@ -132,8 +220,8 @@ pub const Feed = struct {
         if (sent != record.len) self.close();
     }
 
-    fn observe(self: *Feed, frame: *Frame, root: tree.ProcessIdentity, start: std.time.Instant, limit_ns: u64) void {
-        const current = tree.observeWorkload(self.allocator, root, start, limit_ns) catch {
+    fn observe(self: *Sampler, frame: *Frame, root: tree.ProcessIdentity, start: std.time.Instant, limit_ns: u64) void {
+        const current = tree.observeWorkload(allocator, root, start, limit_ns) catch {
             self.setBaseline(null);
             return;
         };

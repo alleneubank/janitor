@@ -95,8 +95,8 @@ the original child process group.
 - **REQ-JANITOR-011**: On Linux, parent exit, child exit, watched-path deletion,
   watched-PID exit, and shutdown signals are watched through `epoll` over
   `pidfd`, `signalfd`, and `inotify`.
-- **REQ-JANITOR-012**: Supported event backends wake on watched events,
-  the configured teardown grace deadline, or an opted-in activity sample.
+- **REQ-JANITOR-012**: Supported event backends wake on watched events
+  and the configured teardown grace deadline.
 - **REQ-JANITOR-013**: When `janitor`'s standard input is a terminal, `janitor`
   transfers terminal foreground ownership (`tcsetpgrp`) to the child process
   group after the child is spawned, so an interactive child receives keyboard
@@ -174,7 +174,8 @@ the original child process group.
   reserved group and still-linked descendants. It excludes executor
   bookkeeping, includes reaped-child CPU, and preserves uncertainty.
 - **REQ-JANITOR-028**: The feed uses a separate nonblocking connection and
-  grants no signal authority. Reader loss leaves ordinary teardown available.
+  grants no signal authority. Process reads and reader backpressure leave
+  the supervision loop available for teardown.
 - **REQ-RELEASE-001**: The repository provides a local macOS release script that
   builds `ReleaseSafe`, applies a credential-free ad-hoc signature, packages
   README and LICENSE beside the binary, extracts the archive, and verifies the
@@ -376,8 +377,12 @@ the original child process group.
   backend selection, plus native and cross-target builds.
 - REQ-JANITOR-013: `src/e2e.zig` `testInteractiveForegroundHandoff`.
 - REQ-JANITOR-027, REQ-JANITOR-028: `src/e2e.zig` `testActivityFeed`
-  exercises escaped descendants, reaped CPU, unresolved waits, and teardown
-  after reader disconnect. `src/activity.zig` covers a replaced PID.
+  exercises a sustained deadlock, an external wait, sibling isolation, hiding
+  the feed descriptor from the command, and escaped-child teardown. The
+  compiled CLI suite also covers attributed reaped CPU, saturated-reader
+  cancellation, a missing listener, and live Linux threads behind a zombie
+  leader. `src/process_tree.zig` covers scope changes and the native macOS SDK
+  layout. `src/activity.zig` covers a replaced PID.
 - REQ-RELEASE-001, REQ-RELEASE-002, REQ-RELEASE-003, REQ-RELEASE-004:
   `scripts/release-macos.sh`, `sh -n scripts/release-macos.sh`, and
   `scripts/release-macos.sh --dry-run --target aarch64-macos`.
